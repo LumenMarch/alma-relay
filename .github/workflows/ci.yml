@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.edition }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [node, cloudflare]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+        if: matrix.edition == 'node'
+      - run: npm run test:cloudflare
+        if: matrix.edition == 'cloudflare'
+      - run: npx wrangler deploy --dry-run --outdir dist
+        if: matrix.edition == 'cloudflare'
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t alma-relay .
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name relay -p 8787:8787 alma-relay
+          for i in $(seq 30); do curl -sf http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
+          docker logs relay; exit 1

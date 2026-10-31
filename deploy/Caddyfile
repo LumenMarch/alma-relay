@@ -1,0 +1,7 @@
+# Caddy gets and renews a Let's Encrypt certificate for RELAY_DOMAIN by itself.
+# Streaming responses (SSE) are flushed immediately; WebSockets pass through.
+{$RELAY_DOMAIN} {
+	reverse_proxy relay:8787 {
+		flush_interval -1
+	}
+}

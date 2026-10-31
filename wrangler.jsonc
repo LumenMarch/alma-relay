@@ -1,0 +1,27 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "alma-relay",
+    "main": "cloudflare/worker.mjs",
+    "compatibility_date": "2026-06-01",
+    // Lets a phone hanging up cancel the request on the desktop.
+    "compatibility_flags": ["enable_request_signal", "request_signal_passthrough"],
+    "durable_objects": {
+        "bindings": [{ "name": "TUNNEL", "class_name": "TunnelDO" }]
+    },
+    // SQLite-backed Durable Objects run on the Workers Free plan.
+    "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TunnelDO"] }],
+    // Serve on your own domain instead of *.workers.dev:
+    // "routes": [{ "pattern": "relay.example.com", "custom_domain": true }],
+    "vars": {
+        // Optional, all of them. Secrets go through `wrangler secret put`:
+        //   RELAY_REGISTRATION_KEY  shared key desktops must present
+        //   RELAY_TOKEN_SECRET      HS256 secret for per-user relay tokens
+        //   APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID   phone notifications
+        //   TURN_SECRET             coturn static-auth-secret
+        //
+        // "LOCATION_HINT": "apac",
+        // "TURN_URLS": "stun:turn.example.com:3478,turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp",
+        // "APNS_TOPIC": "me.yetone.alma"
+    },
+    "observability": { "enabled": true }
+}

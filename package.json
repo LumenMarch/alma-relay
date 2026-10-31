@@ -1,0 +1,38 @@
+{
+    "name": "alma-relay",
+    "version": "1.0.0",
+    "description": "Self-hostable relay that lets the Alma mobile app reach your desktop Alma from anywhere — Node/Docker or Cloudflare Workers",
+    "license": "MIT",
+    "type": "module",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/yetone/alma-relay.git"
+    },
+    "bin": {
+        "alma-relay": "./index.mjs"
+    },
+    "main": "index.mjs",
+    "files": [
+        "index.mjs",
+        "shared.mjs",
+        "apns.mjs",
+        "scripts/mint-token.mjs"
+    ],
+    "scripts": {
+        "start": "node index.mjs",
+        "test": "node test/e2e.mjs",
+        "test:cloudflare": "node test/e2e.mjs --cloudflare",
+        "dev:cloudflare": "wrangler dev",
+        "deploy:cloudflare": "wrangler deploy",
+        "mint-token": "node scripts/mint-token.mjs"
+    },
+    "engines": {
+        "node": ">=20"
+    },
+    "dependencies": {
+        "ws": "^8.18.3"
+    },
+    "devDependencies": {
+        "wrangler": "^4.20.0"
+    }
+}
