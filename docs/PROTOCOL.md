@@ -13,6 +13,9 @@ desktop (agent)  ──WSS /agent?th=<tokenHash>──▶  relay  ◀── HTTP
 - With end-to-end encryption on (the default), the phone addresses the desktop
   by a **routing token**, a one-way derivation of the code. With E2E off,
   the token is the code itself.
+- With E2E on, the desktop serves **only** `wopen` for `/__alma_e2e__`. It
+  answers any plaintext `hreq` with `403` and any other `wopen` with `werr`,
+  because only the relay itself could have sent them (Alma ≥ 0.4.329).
 - The desktop registers with `tokenHash = sha256_hex(token)`. The relay keeps
   only that hash, in memory, and finds the desktop for `/c/<token>/…` by
   hashing the token from the URL. Tokens are `[A-Za-z0-9_-]{16,128}`.

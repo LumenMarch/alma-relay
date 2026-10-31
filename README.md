@@ -182,6 +182,10 @@ relay only issues short-lived credentials. Media never passes through it.
   derive an AES-256-GCM session. The connect code is part of the key
   derivation, so whoever runs the relay can't intercept or read the traffic.
   Sessions have forward secrecy.
+- **Use Alma 0.4.329 or later.** From that version on, a desktop with E2E on
+  refuses every plaintext request, so whoever runs the relay can't call the
+  desktop's API directly. Earlier versions still answered plaintext requests
+  sent by the relay itself.
 - **Nothing to steal.** The relay routes by `sha256(routing token)`, and the
   routing token is a one-way derivation of the code. Codes, tokens and
   traffic are never written to disk or logs.
