@@ -10,7 +10,7 @@ export const tokenHashOf = code => createHash('sha256').update(code).digest('hex
 
 export class FakeAgent {
     /**
-     * @param {{relay: string, code: string, backendPort: number, key?: string, wopenDelayMs?: number}} opts
+     * @param {{relay: string, code: string, backendPort: number, key?: string, wopenDelayMs?: number, agentQuery?: string}} opts
      */
     constructor(opts) {
         this.opts = opts;
@@ -26,7 +26,7 @@ export class FakeAgent {
         const { relay, code, key } = this.opts;
         const th = tokenHashOf(code);
         return new Promise((resolve, reject) => {
-            const ws = new WebSocket(`${relay.replace(/^http/, 'ws')}/agent?th=${th}`, { maxPayload: 256 * 1024 * 1024 });
+            const ws = new WebSocket(`${relay.replace(/^http/, 'ws')}/agent?th=${th}${this.opts.agentQuery || ''}`, { maxPayload: 256 * 1024 * 1024 });
             this.ws = ws;
             let settled = false;
             const settle = (fn, v) => {

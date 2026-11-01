@@ -1,6 +1,6 @@
 {
     "name": "alma-relay",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "description": "Self-hostable relay that lets the Alma mobile app reach your desktop Alma from anywhere — Node/Docker or Cloudflare Workers",
     "license": "MIT",
     "type": "module",
@@ -16,6 +16,7 @@
         "index.mjs",
         "shared.mjs",
         "apns.mjs",
+        "cloudflare/worker.mjs",
         "scripts/mint-token.mjs"
     ],
     "scripts": {

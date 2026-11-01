@@ -452,7 +452,7 @@ function handleAgent(ws) {
             const auth = await authorize(env, frame.key);
             if (!auth.ok) {
                 ws.send(JSON.stringify({ t: 'error', message: auth.message }));
-                ws.close(auth.code, auth.message);
+                ws.close(auth.code, auth.reason);
                 return;
             }
             if (!isTokenHash(frame.tokenHash)) {

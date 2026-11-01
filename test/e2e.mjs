@@ -129,13 +129,13 @@ await new Promise(r => backend.listen(BACKEND_PORT, '127.0.0.1', r));
 // ---------------------------------------------------------------------------
 // Relay launchers
 // ---------------------------------------------------------------------------
-async function startRelay(vars = {}) {
+async function startRelay(vars = {}, { main } = {}) {
     if (EXTERNAL) return { origin: EXTERNAL, stop() {} };
     const port = nextRelayPort++;
     const origin = `http://127.0.0.1:${port}`;
     let child;
     if (EDITION === 'cloudflare') {
-        const args = ['wrangler', 'dev', '--local', '--ip', '127.0.0.1', '--port', String(port), '--inspector-port', String(port + 1000)];
+        const args = ['wrangler', 'dev', ...(main ? [main] : []), '--local', '--ip', '127.0.0.1', '--port', String(port), '--inspector-port', String(port + 1000)];
         for (const [k, v] of Object.entries(vars)) args.push('--var', `${k}:${v}`);
         child = spawn('npx', args, { cwd: ROOT, env: { ...process.env, CI: '1', WRANGLER_SEND_METRICS: 'false' }, stdio: ['ignore', 'pipe', 'pipe'] });
     } else {
@@ -380,9 +380,14 @@ if (!EXTERNAL) {
 if (!EXTERNAL) {
     const SECRET = randomBytes(24).toString('hex');
     const now = Math.floor(Date.now() / 1000);
-    const relay = await startRelay({ RELAY_TOKEN_SECRET: SECRET });
+    const TOKEN_MESSAGE = 'Sign in to use this relay';
+    // LOCATION_HINT puts Cloudflare tunnels under a `<hint>:` name; the Node edition ignores it.
+    const relay = await startRelay({ RELAY_TOKEN_SECRET: SECRET, RELAY_TOKEN_MESSAGE: TOKEN_MESSAGE, LOCATION_HINT: 'apac' });
     try {
         check('no token → 4401', (await rejectedWith({ relay: relay.origin, code: newCode() })) === 4401);
+        const unsigned = new FakeAgent({ relay: relay.origin, code: newCode(), backendPort: BACKEND_PORT });
+        await unsigned.connect().catch(() => {});
+        check('RELAY_TOKEN_MESSAGE is what the desktop is told', unsigned.errors[0] === TOKEN_MESSAGE, JSON.stringify(unsigned.errors));
         check(
             'expired token → 4401',
             (await rejectedWith({ relay: relay.origin, code: newCode(), key: mintToken(SECRET, { sub: 'u1', aud: 'alma-relay', exp: now - 10 }) })) === 4401
@@ -405,6 +410,11 @@ if (!EXTERNAL) {
         const agent = await connected({ relay: relay.origin, code: CODE, key: minted });
         const res = await fetch(`${relay.origin}/c/${CODE}/api/health`);
         check('token from scripts/mint-token.mjs registers and tunnels', res.status === 200, `status=${res.status}`);
+        const drop = await fetch(`${relay.origin}/c/${CODE}/api/drop`);
+        const dropBody = await drop.json().catch(() => ({}));
+        check('with a location hint, a desktop error still reaches the phone', drop.status === 502 && !/offline/.test(dropBody.error || ''), `${drop.status} ${JSON.stringify(dropBody)}`);
+        const gone = await fetch(`${relay.origin}/c/${newCode()}/api/health`);
+        check('with a location hint, an unknown code → 502', gone.status === 502, `status=${gone.status}`);
         agent.close();
     } catch (e) {
         check('suite: relay tokens', false, e.stack);
@@ -415,7 +425,34 @@ if (!EXTERNAL) {
 }
 
 // ---------------------------------------------------------------------------
-// Suite 4 (Node edition): flow control and limits
+// Suite 4 (Cloudflare edition): a desktop still in its un-hinted tunnel
+// ---------------------------------------------------------------------------
+if (EDITION === 'cloudflare') {
+    const relay = await startRelay({ LOCATION_HINT: 'apac' }, { main: 'test/legacy-worker.mjs' });
+    try {
+        const CODE = newCode();
+        const legacy = await connected({ relay: relay.origin, code: CODE, agentQuery: '&legacy=1' });
+        const res = await fetch(`${relay.origin}/c/${CODE}/api/echo`, { method: 'POST', body: 'hello-legacy' });
+        const body = await res.json().catch(() => ({}));
+        check('phone reaches a desktop still in its un-hinted tunnel', res.status === 200 && body.body === 'hello-legacy', `${res.status} ${JSON.stringify(body)}`);
+        const ws = await openPhoneSocket(`${relay.origin.replace(/^http/, 'ws')}/c/${CODE}/ws/hello`);
+        check('…over WebSocket too', await waitFor(() => ws.messages.includes('hello-from-desktop')));
+        ws.close();
+        legacy.close();
+        const moved = await connected({ relay: relay.origin, code: CODE });
+        const again = await fetch(`${relay.origin}/c/${CODE}/api/health`);
+        check('…and in the hinted tunnel once it redials', again.status === 200, `status=${again.status}`);
+        moved.close();
+    } catch (e) {
+        check('suite: legacy tunnels', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 5 (Node edition): flow control and limits
 // ---------------------------------------------------------------------------
 if (EDITION === 'node') {
     const relay = await startRelay({

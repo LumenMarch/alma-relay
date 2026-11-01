@@ -82,6 +82,7 @@ npx github:yetone/alma-relay
 | --- | --- |
 | `RELAY_REGISTRATION_KEY` | 共享密钥。桌面端必须带上它才能注册，在 Alma 里粘贴到令牌处即可。 |
 | `RELAY_TOKEN_SECRET` | 改用按用户签发的令牌，适合一个中继给团队共用（见下文）。设置后优先于 `RELAY_REGISTRATION_KEY`。 |
+| `RELAY_TOKEN_MESSAGE` | 桌面端没有有效令牌时收到的提示，比如告诉对方去哪儿领令牌（默认 `A valid relay token is required`）。 |
 | `PORT` / `HOST` | 监听地址（Node 版默认 `8787` / `0.0.0.0`）。 |
 | `MAX_BODY_MB` | 请求体上限，单位 MB（Node 版默认 128，Cloudflare 版固定为 24）。 |
 | `MAX_BUFFERED_MB` | Node 版：同时缓存在内存里的请求体总量上限，单位 MB（默认 512），超出返回 `503`。 |
@@ -89,7 +90,7 @@ npx github:yetone/alma-relay
 | `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Node 版：每台桌面端的并发 HTTP 请求 / WebSocket 上限（默认各 256）。 |
 | `MAX_CONNECTIONS` | Node 版：进程的 TCP 连接上限（默认不限）。 |
 | `STALL_TIMEOUT_S` | Node 版：手机端这么多秒读不走任何数据就断开（默认 60）。见[流控](docs/PROTOCOL.md#flow-control-node-edition)。 |
-| `LOCATION_HINT` | 仅 Cloudflare：指定隧道所在区域，例如 `apac`、`enam`、`weur`。默认会建在离桌面端近的地方；桌面端通过代理、离手机很远时，可以用它把隧道放到手机附近。 |
+| `LOCATION_HINT` | 仅 Cloudflare：指定隧道所在区域，例如 `apac`、`enam`、`weur`。默认会建在离桌面端近的地方；桌面端通过代理、离手机很远时，可以用它把隧道放到手机附近。改了之后，每台桌面端下次重连时会换到新区域的隧道；还没重连的，手机也照样找得到。 |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | 为手机实时查看桌面浏览器（WebRTC）签发 TURN 凭据。 |
 | `APNS_KEY_FILE` 或 `APNS_KEY`，以及 `APNS_KEY_ID`、`APNS_TEAM_ID`、`APNS_TOPIC` | 手机通知（见下文）。 |
 

@@ -2,7 +2,7 @@
 // Everything here uses WebCrypto + standard globals, so it runs unchanged in
 // Node >= 20 and inside a Worker.
 
-export const VERSION = '1.0.1';
+export const VERSION = '1.1.0';
 
 /** Phone-facing paths look like /c/<code>/rest?query. Never log the code. */
 const CLIENT_PATH = /^\/c\/([A-Za-z0-9_-]{16,128})(\/.*)?$/;
@@ -101,11 +101,11 @@ export async function verifyRelayToken(token, secret) {
 export async function authorize(env, presented) {
     if (env.RELAY_TOKEN_SECRET) {
         const claims = await verifyRelayToken(presented, env.RELAY_TOKEN_SECRET);
-        if (!claims) return { ok: false, message: 'A valid relay token is required', code: 4401 };
+        if (!claims) return { ok: false, message: env.RELAY_TOKEN_MESSAGE || 'A valid relay token is required', reason: 'Relay token required', code: 4401 };
         return { ok: true, subject: String(claims.sub) };
     }
     if (env.RELAY_REGISTRATION_KEY && !safeEqual(presented || '', env.RELAY_REGISTRATION_KEY)) {
-        return { ok: false, message: 'Invalid registration key', code: 4003 };
+        return { ok: false, message: 'Invalid registration key', reason: 'Invalid registration key', code: 4003 };
     }
     return { ok: true, subject: null };
 }

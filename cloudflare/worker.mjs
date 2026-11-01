@@ -22,6 +22,15 @@ const MAX_BODY = 24 * 1024 * 1024; // keep hreq frames well under the 32 MiB DO 
 const json = (status, obj) =>
     new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' } });
 
+// Marks the "no desktop in this tunnel" answer, so the worker can tell it
+// from a 502 the desktop itself sent (see legacy tunnels below).
+const OFFLINE_HEADER = 'x-alma-tunnel-offline';
+const offline = () => {
+    const res = json(502, { error: 'Desktop is offline or the connect code is invalid' });
+    res.headers.set(OFFLINE_HEADER, '1');
+    return res;
+};
+
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
@@ -62,22 +71,55 @@ export default {
         const parsed = parseClientPath(url.pathname);
         if (!parsed) return json(404, { error: 'Not found' });
 
-        const fwd = new Request(`https://tunnel${parsed.rest}${url.search}`, request);
-        fwd.headers.set('x-alma-tunnel-role', 'client');
-        return tunnelFor(env, await sha256hex(parsed.code)).fetch(fwd);
+        const th = await sha256hex(parsed.code);
+        const target = `https://tunnel${parsed.rest}${url.search}`;
+        const legacy = legacyTunnelFor(env, th);
+        if (!legacy) return tunnelFor(env, th).fetch(clientRequest(target, request));
+
+        // The request may go to two tunnels, so read its body once up front
+        // (the tunnel buffers it anyway). A tee'd stream does not survive the
+        // first tunnel turning it down.
+        let init = request;
+        if (request.body) {
+            const body = await request.arrayBuffer();
+            if (body.byteLength > MAX_BODY) return json(413, { error: 'Request body too large' });
+            init = { method: request.method, headers: request.headers, body, signal: request.signal };
+        }
+        const response = await tunnelFor(env, th).fetch(clientRequest(target, init));
+        if (!response.headers.has(OFFLINE_HEADER)) return response;
+        return legacy.fetch(clientRequest(target, init));
     },
 };
 
+function clientRequest(target, init) {
+    const fwd = new Request(target, init);
+    fwd.headers.set('x-alma-tunnel-role', 'client');
+    return fwd;
+}
+
 /**
- * A Durable Object lives in the region where it was first created — by
+ * A Durable Object stays in the region where it was first created — by
  * default near whoever dialled in first (the desktop). If your desktop sits
  * behind a proxy far from your phone, set LOCATION_HINT (e.g. "apac", "enam",
- * "weur") to pin tunnels near the phone instead. Tunnels hold no storage, so
- * changing it only affects where the next connection lands.
+ * "weur") to pin tunnels near the phone instead.
+ *
+ * Because a Durable Object never moves, tunnels are named `<hint>:<hash>`:
+ * a new hint gives every desktop a fresh tunnel in the new region the next
+ * time it redials. Until then it is still in its old, un-hinted tunnel
+ * (hibernated sockets survive a deploy), so a phone that finds no desktop in
+ * the hinted tunnel tries that one too.
  */
+const locationHint = env => String(env.LOCATION_HINT || '').trim().toLowerCase();
+
 function tunnelFor(env, th) {
-    const hint = String(env.LOCATION_HINT || '').trim();
-    return env.TUNNEL.get(env.TUNNEL.idFromName(th), hint ? { locationHint: hint } : undefined);
+    const hint = locationHint(env);
+    if (!hint) return env.TUNNEL.get(env.TUNNEL.idFromName(th));
+    return env.TUNNEL.get(env.TUNNEL.idFromName(`${hint}:${th}`), { locationHint: hint });
+}
+
+/** The un-hinted tunnel a desktop may still be in, or null without a hint. */
+function legacyTunnelFor(env, th) {
+    return locationHint(env) ? env.TUNNEL.get(env.TUNNEL.idFromName(th)) : null;
 }
 
 export class TunnelDO extends DurableObject {
@@ -170,7 +212,7 @@ export class TunnelDO extends DurableObject {
 
     acceptClientSocket(request) {
         const agent = this.agentSocket();
-        if (!agent) return json(502, { error: 'Desktop is offline or the connect code is invalid' });
+        if (!agent) return offline();
 
         const url = new URL(request.url);
         const id = this.nextId('w');
@@ -185,7 +227,7 @@ export class TunnelDO extends DurableObject {
 
     async tunnelHttp(request) {
         const agent = this.agentSocket();
-        if (!agent) return json(502, { error: 'Desktop is offline or the connect code is invalid' });
+        if (!agent) return offline();
 
         const url = new URL(request.url);
         const id = this.nextId('h');
@@ -336,13 +378,14 @@ export class TunnelDO extends DurableObject {
             const auth = await authorize(this.env, frame.key);
             if (!auth.ok) {
                 ws.send(JSON.stringify({ t: 'error', message: auth.message }));
-                ws.close(auth.code, auth.message);
+                ws.close(auth.code, auth.reason);
                 return;
             }
             const account = auth.subject;
-            // The DO is named by the token hash, so a mismatched register
-            // frame means the agent dialled the wrong tunnel.
-            if (frame.tokenHash !== this.ctx.id.name) {
+            // The DO is named by the token hash (after an optional
+            // `<hint>:` prefix), so a mismatched register frame means the
+            // agent dialled the wrong tunnel.
+            if (frame.tokenHash !== String(this.ctx.id.name || '').replace(/^[a-z0-9-]+:/, '')) {
                 ws.send(JSON.stringify({ t: 'error', message: 'Token hash mismatch' }));
                 ws.close(4002, 'Token hash mismatch');
                 return;
