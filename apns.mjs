@@ -2,7 +2,7 @@
 //
 // The desktop never talks to Apple: it sends the relay a `push` frame
 //
-//   {t:'push', id, notifications:[{token, environment, collapseId?, payload}]}
+//   {t:'push', id, notifications:[{token, environment, collapseId?, pushType?, priority?, payload}]}
 //
 // and the relay, which holds the team's APNs signing key, forwards each
 // notification to Apple and answers
@@ -92,9 +92,10 @@ export function validateNotification(n) {
 export function apnsRequestHeaders(token, topic, n) {
     const headers = {
         authorization: `bearer ${token}`,
-        'apns-topic': topic,
-        'apns-push-type': 'alert',
-        'apns-priority': '10',
+        // A Live Activity update goes to the app's `.push-type.liveactivity` topic.
+        'apns-topic': n.pushType === 'liveactivity' ? `${topic}.push-type.liveactivity` : topic,
+        'apns-push-type': n.pushType === 'liveactivity' ? 'liveactivity' : 'alert',
+        'apns-priority': n.priority === 5 ? '5' : '10',
         'content-type': 'application/json',
     };
     if (typeof n.collapseId === 'string' && n.collapseId) headers['apns-collapse-id'] = n.collapseId.slice(0, 64);

@@ -2,7 +2,7 @@
 // Everything here uses WebCrypto + standard globals, so it runs unchanged in
 // Node >= 20 and inside a Worker.
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.0.1';
 
 /** Phone-facing paths look like /c/<code>/rest?query. Never log the code. */
 const CLIENT_PATH = /^\/c\/([A-Za-z0-9_-]{16,128})(\/.*)?$/;

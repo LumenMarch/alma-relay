@@ -41,7 +41,7 @@ messages travel as `s`.
 | agent → relay | `{t:'wopened', id}` / `{t:'werr', id, message}` | The relay queues the phone's messages until `wopened`. |
 | both | `{t:'wmsg', id, s}` / `{t:'wmsg', id, b}` | Text / binary message. |
 | both | `{t:'wclose', id, code?, reason?}` | Close one bridged socket. |
-| agent → relay | `{t:'push', id, notifications:[{token, environment, collapseId?, payload}]}` | Ask the relay to deliver APNs notifications. |
+| agent → relay | `{t:'push', id, notifications:[{token, environment, collapseId?, pushType?, priority?, payload}]}` | Ask the relay to deliver APNs notifications. `pushType: 'liveactivity'` sends a Live Activity update (to `<topic>.push-type.liveactivity`); `priority: 5` sends it at low priority. |
 | relay → agent | `{t:'pushed', id, results:[{token, status, reason?}]}` / `{t:'pushed', id, unsupported:true}` | Per-token outcome, or "this relay has no APNs key". |
 
 When the agent socket closes, the relay fails in-flight requests with `502`
