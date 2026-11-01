@@ -63,3 +63,23 @@ talking into a dead tunnel.
 | --- | --- | --- |
 | Request body | 128 MB (`MAX_BODY_MB`) | 24 MB (Durable Object WebSocket messages are capped at 32 MiB) |
 | Waiting for the response head | 120 s | 120 s |
+| Agent frame | 32 MiB | 32 MiB |
+| Phone WebSocket message | 24 MiB | 24 MiB |
+| Phone bytes held before `wopened` | 4 MiB (then close `1009`) | — |
+| Request bodies buffered at once | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
+| Desktops | 10 000 (`MAX_AGENTS`, then close `1013`) | — |
+| Concurrent requests / sockets per desktop | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) | — |
+| Registering | within 10 s of connecting | — |
+
+## Flow control (Node edition)
+
+The relay never buffers a whole stream. When a phone reads slower than the
+desktop sends, the relay stops reading the agent socket once that phone has
+8 MiB queued, which pushes back on the desktop over TCP; it resumes below
+1 MiB. A phone that drains nothing for `STALL_TIMEOUT_S` (60 s) is cut off
+(`hcancel`, or the bridged socket is terminated). The other way round, phone
+sockets are paused while the agent socket has more than 8 MiB unsent.
+
+The pause covers the whole agent socket, so one stuck phone briefly holds up
+the desktop's other streams until it drains or is cut off. Desktops should
+wait for their own socket to drain before sending more (Alma does).

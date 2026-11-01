@@ -72,7 +72,19 @@ export class FakeAgent {
                     },
                     res => {
                         this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers: res.headers });
-                        res.on('data', chunk => this.send({ t: 'hchunk', id: frame.id, b: chunk.toString('base64') }));
+                        res.on('data', chunk => {
+                            this.send({ t: 'hchunk', id: frame.id, b: chunk.toString('base64') });
+                            // Like Alma's desktop, wait for the relay socket to drain.
+                            if (this.ws.bufferedAmount > 1024 * 1024) {
+                                res.pause();
+                                const timer = setInterval(() => {
+                                    if (this.ws.bufferedAmount < 256 * 1024 || this.ws.readyState !== WebSocket.OPEN) {
+                                        clearInterval(timer);
+                                        res.resume();
+                                    }
+                                }, 10);
+                            }
+                        });
                         res.on('end', () => {
                             this.http.delete(frame.id);
                             this.send({ t: 'hend', id: frame.id });

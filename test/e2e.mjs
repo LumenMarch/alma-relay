@@ -10,7 +10,7 @@
 // Exit status is the number of failed checks (0 = all pass).
 
 import { spawn } from 'node:child_process';
-import { createServer } from 'node:http';
+import { createServer, get as httpGet } from 'node:http';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -39,6 +39,7 @@ const sha = b => createHash('sha256').update(b).digest('hex');
 // ---------------------------------------------------------------------------
 const bigPayload = randomBytes(5 * 1024 * 1024);
 let lastSlowClosed = false;
+const firehose = { written: 0, closed: false };
 
 const backend = createServer((req, res) => {
     if (req.url === '/api/health') {
@@ -86,6 +87,23 @@ const backend = createServer((req, res) => {
         res.write('data: first\n\n');
         res.on('close', () => (lastSlowClosed = true));
         return;
+    }
+    if (req.url.startsWith('/api/firehose')) {
+        // Streams `mb` MB as fast as the reader takes it, honouring backpressure.
+        const total = Number(new URL(req.url, 'http://x').searchParams.get('mb') || 256) * 1024 * 1024;
+        const chunk = Buffer.alloc(64 * 1024, 7);
+        firehose.written = 0;
+        firehose.closed = false;
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(total) });
+        res.on('close', () => (firehose.closed = true));
+        const pump = () => {
+            while (firehose.written < total && !res.destroyed) {
+                firehose.written += chunk.length;
+                if (!res.write(chunk)) return res.once('drain', pump);
+            }
+            res.end();
+        };
+        return pump();
     }
     if (req.url === '/api/big') {
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(bigPayload.length) });
@@ -390,6 +408,96 @@ if (!EXTERNAL) {
         agent.close();
     } catch (e) {
         check('suite: relay tokens', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 4 (Node edition): flow control and limits
+// ---------------------------------------------------------------------------
+if (EDITION === 'node') {
+    const relay = await startRelay({
+        STALL_TIMEOUT_S: '2',
+        MAX_BODY_MB: '1',
+        MAX_AGENTS: '1',
+        MAX_REQUESTS_PER_AGENT: '3',
+        MAX_SOCKETS_PER_AGENT: '2',
+    });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    const wsBase = base.replace(/^http/, 'ws');
+    /** A phone GET whose body it reads only when told to. */
+    const phoneGet = url =>
+        new Promise((resolve, reject) => {
+            httpGet(url, { agent: false }, res => {
+                res.pause();
+                res.received = 0;
+                res.ended = new Promise(r => {
+                    res.on('data', c => (res.received += c.length));
+                    res.on('end', () => r('end'));
+                    res.on('aborted', () => r('aborted'));
+                    res.on('error', () => r('error'));
+                    res.on('close', () => r('close'));
+                });
+                resolve(res);
+            }).on('error', reject);
+        });
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE });
+
+        // A phone that stops reading: the relay stops reading the desktop
+        // instead of buffering the whole stream in memory...
+        const stuck = await phoneGet(`${base}/api/firehose?mb=256`);
+        await sleep(1000);
+        const writtenWhileStuck = firehose.written;
+        check('slow phone: desktop is held back (backpressure)', writtenWhileStuck < 64 * 1024 * 1024, `${(writtenWhileStuck / 1048576).toFixed(1)} MB written`);
+        // ...and cuts it off once it has drained nothing for STALL_TIMEOUT_S.
+        check('stalled phone is cut off and the desktop told to stop', (await waitFor(() => firehose.closed, 5000)) && firehose.written < 128 * 1024 * 1024, `closed=${firehose.closed} written=${firehose.written}`);
+        stuck.destroy();
+        const after = await fetch(`${base}/api/health`);
+        check('tunnel works again after a stalled phone', after.status === 200, `status=${after.status}`);
+
+        // A phone that pauses briefly and then reads gets every byte.
+        const paused = await phoneGet(`${base}/api/firehose?mb=32`);
+        await sleep(800);
+        paused.resume();
+        const how = await paused.ended;
+        check('paused phone resumes and gets the whole body', how === 'end' && paused.received === 32 * 1024 * 1024, `${how} ${paused.received}`);
+
+        // Limits.
+        const big = await fetch(`${base}/api/echo`, { method: 'POST', body: Buffer.alloc(2 * 1024 * 1024) });
+        check('body over MAX_BODY_MB → 413', big.status === 413, `status=${big.status}`);
+
+        const hanging = await Promise.all([0, 1, 2].map(() => phoneGet(`${base}/api/slow`)));
+        const fourth = await fetch(`${base}/api/health`);
+        check('MAX_REQUESTS_PER_AGENT → 503', fourth.status === 503, `status=${fourth.status}`);
+        for (const r of hanging) r.destroy();
+        await sleep(300);
+        const freed = await fetch(`${base}/api/health`);
+        check('request slots free up again', freed.status === 200, `status=${freed.status}`);
+
+        const s1 = await openPhoneSocket(`${wsBase}/ws/echo`);
+        const s2 = await openPhoneSocket(`${wsBase}/ws/echo`);
+        const third = await openPhoneSocket(`${wsBase}/ws/echo`).then(
+            ws => (ws.close(), 'opened'),
+            e => e.message
+        );
+        check('MAX_SOCKETS_PER_AGENT → upgrade refused', /503/.test(third), third);
+
+        s1.send(Buffer.alloc(25 * 1024 * 1024), { binary: true });
+        check('phone message over 24 MB closes the socket with 1009', (await Promise.race([s1.closedWith, sleep(5000 * SLACK).then(() => 'still open')])) === 1009);
+        s2.close();
+
+        const other = await rejectedWith({ relay: relay.origin, code: newCode() });
+        check('MAX_AGENTS → a new desktop is refused with 1013', other === 1013, String(other));
+        const same = await connected({ relay: relay.origin, code: CODE });
+        check('MAX_AGENTS still lets a desktop replace itself', !!same);
+        same.close();
+        agent.close();
+    } catch (e) {
+        check('suite: flow control and limits', false, e.stack);
         if (relay.log) console.log(relay.log());
     } finally {
         relay.stop();

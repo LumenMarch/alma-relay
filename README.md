@@ -120,6 +120,11 @@ settings) on Cloudflare. All of them are optional.
 | `RELAY_TOKEN_SECRET` | Use per-user signed tokens instead of a shared key. Useful when you run one relay for a team (see below). Takes precedence over `RELAY_REGISTRATION_KEY`. |
 | `PORT` / `HOST` | Listen address (Node: `8787` / `0.0.0.0`). |
 | `MAX_BODY_MB` | Request-body cap in MB (Node: `128`. Cloudflare is fixed at 24). |
+| `MAX_BUFFERED_MB` | Node: cap on all request bodies held in memory at once, in MB (`512`); over it, `503`. |
+| `MAX_AGENTS` | Node: most desktops at once (`10000`). |
+| `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Node: concurrent HTTP requests / WebSockets per desktop (`256` each). |
+| `MAX_CONNECTIONS` | Node: TCP connection cap for the process (unset: no cap). |
+| `STALL_TIMEOUT_S` | Node: cut off a phone that reads nothing for this many seconds (`60`). See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |
 | `LOCATION_HINT` | Cloudflare only: where tunnels live, for example `apac`, `enam` or `weur`. By default a tunnel is created near the desktop. Set this when the desktop sits behind a proxy far away from the phone. |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | Serve TURN credentials for the phone's live view of the desktop browser (WebRTC). |
 | `APNS_KEY_FILE` or `APNS_KEY`, plus `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` | Phone notifications (see below). |
