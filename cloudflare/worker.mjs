@@ -223,7 +223,7 @@ export class TunnelDO extends DurableObject {
                 if (this.pending.get(id) === entry && !entry.headersSent) {
                     this.pending.delete(id);
                     this.sendToAgent({ t: 'hcancel', id });
-                    resolve({ status: 504, headers: { 'content-type': 'application/json' }, error: true });
+                    resolve({ status: 504, error: true, message: 'Desktop did not respond in time' });
                 }
             }, HEAD_TIMEOUT_MS);
         });
@@ -287,7 +287,7 @@ export class TunnelDO extends DurableObject {
         const res = await head;
         if (res.error) {
             this.pending.delete(id);
-            return json(504, { error: 'Desktop did not respond in time' });
+            return json(res.status, { error: res.message });
         }
         entry.headersSent = true;
 
@@ -414,7 +414,7 @@ export class TunnelDO extends DurableObject {
                 this.pending.delete(frame.id);
                 clearTimeout(entry.timer);
                 if (!entry.headersSent) {
-                    entry.headResolve?.({ status: 502, headers: { 'content-type': 'application/json' }, error: true });
+                    entry.headResolve?.({ status: 502, error: true, message: String(frame.message || 'Upstream error') });
                 } else {
                     entry.fail?.(String(frame.message || 'Upstream error'));
                 }
@@ -464,7 +464,15 @@ export class TunnelDO extends DurableObject {
         }
     }
 
-    async webSocketClose(ws) {
+    async webSocketClose(ws, code, reason) {
+        // Finish the close handshake: the runtime does not answer the peer's
+        // close frame for us, and until we close our end the peer sits in
+        // CLOSING until the edge drops the TCP connection (~10 s, code 1006).
+        try {
+            ws.close(sanitizeCloseCode(code), String(reason || '').slice(0, 120));
+        } catch {
+            /* already closed */
+        }
         const attachment = ws.deserializeAttachment() || {};
         if (attachment.role === 'agent' && attachment.registered) {
             // Desktop went away: fail in-flight requests, drop bridged sockets.
@@ -479,7 +487,7 @@ export class TunnelDO extends DurableObject {
     dropTunnels(reason) {
         for (const [id, entry] of this.pending) {
             clearTimeout(entry.timer);
-            if (!entry.headersSent) entry.headResolve?.({ status: 502, headers: { 'content-type': 'application/json' }, error: true });
+            if (!entry.headersSent) entry.headResolve?.({ status: 502, error: true, message: 'Desktop disconnected from relay' });
             else entry.fail?.('Desktop disconnected from relay');
             this.pending.delete(id);
         }
@@ -494,6 +502,6 @@ export class TunnelDO extends DurableObject {
     }
 
     async webSocketError(ws) {
-        return this.webSocketClose(ws);
+        return this.webSocketClose(ws, 1011, 'WebSocket error');
     }
 }

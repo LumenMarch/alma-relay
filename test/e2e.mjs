@@ -95,6 +95,10 @@ const backend = createServer((req, res) => {
         res.writeHead(204);
         return res.end();
     }
+    if (req.url === '/api/drop') {
+        // The desktop's own request fails before any response head → herr.
+        return req.socket.destroy();
+    }
     res.writeHead(404).end();
 });
 const backendWss = new WebSocketServer({ server: backend });
@@ -219,6 +223,10 @@ console.log(`[e2e] edition: ${EDITION}`);
             check('204 with no body', res.status === 204, `status=${res.status}`);
         }
         {
+            const res = await fetch(`${base}/api/drop`);
+            check('desktop error before the head → 502', res.status === 502, `status=${res.status}`);
+        }
+        {
             const t0 = Date.now();
             const reader = (await fetch(`${base}/api/sse`)).body.getReader();
             let first = 0;
@@ -256,8 +264,11 @@ console.log(`[e2e] edition: ${EDITION}`);
         {
             const ws = await openPhoneSocket(`${wsBase}/ws/hello`);
             check('desktop-initiated WebSocket message', await waitFor(() => ws.messages[0] === 'hello-from-desktop'));
+            const t0 = Date.now();
             ws.close();
             check('phone close reaches the desktop', await waitFor(() => agent.sockets.size === 0));
+            const closeCode = await Promise.race([ws.closedWith, sleep(2000 * SLACK).then(() => 'open')]);
+            check('…and the close handshake completes', closeCode === 1000 || closeCode === 1005, `code=${closeCode} after ${Date.now() - t0}ms`);
         }
         if (EDITION === 'cloudflare') {
             // `wrangler dev` fronts workerd with its own proxy, which keeps the
