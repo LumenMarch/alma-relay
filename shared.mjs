@@ -2,7 +2,63 @@
 // Everything here uses WebCrypto + standard globals, so it runs unchanged in
 // Node >= 20 and inside a Worker.
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
+
+// ---------------------------------------------------------------------------
+// Agent protocol versions (docs/PROTOCOL.md).
+//
+//   1  JSON text frames only; request bodies arrive whole, base64, in `hreq`.
+//   2  Payload bytes travel in binary frames, and request bodies are streamed
+//      to the desktop with a per-request credit window.
+//
+// The desktop offers `proto` in `register`; the relay answers the version it
+// will speak in `registered`. Either side that never mentions it speaks 1, so
+// old desktops on new relays and new desktops on old relays keep working.
+// ---------------------------------------------------------------------------
+export const PROTOCOL = 2;
+
+/** Negotiated version: the lower of what the desktop offers and the relay allows. */
+export function negotiateProtocol(offered, relayMax = PROTOCOL) {
+    const n = Math.floor(Number(offered));
+    const max = Math.max(1, Math.min(PROTOCOL, Math.floor(Number(relayMax)) || PROTOCOL));
+    return Number.isFinite(n) && n >= 2 ? Math.min(n, max) : 1;
+}
+
+/** Binary frame kinds (protocol 2). */
+export const BIN = Object.freeze({
+    HCHUNK: 1, // agent -> relay: response body bytes
+    HBODY: 2, // relay -> agent: request body bytes
+    WBIN: 3, // both: a binary WebSocket message
+    WTEXT: 4, // both: a text WebSocket message, UTF-8
+});
+
+/** Request body bytes the relay may send ahead of the desktop's `hack`s. */
+export const BODY_WINDOW = 4 * 1024 * 1024;
+/** Largest request body slice the relay puts in one frame. */
+export const BODY_SLICE = 256 * 1024;
+
+const textEncoder = new TextEncoder();
+
+/** `[kind:u8][idLength:u8][id:utf8][payload]` */
+export function encodeBinary(kind, id, payload) {
+    const idBytes = textEncoder.encode(String(id));
+    if (idBytes.length > 255) throw new Error('frame id too long');
+    const bytes = typeof payload === 'string' ? textEncoder.encode(payload) : payload;
+    const out = new Uint8Array(2 + idBytes.length + bytes.length);
+    out[0] = kind;
+    out[1] = idBytes.length;
+    out.set(idBytes, 2);
+    out.set(bytes, 2 + idBytes.length);
+    return out;
+}
+
+/** -> {kind, id, data} (data is a view into `bytes`), or null if malformed. */
+export function decodeBinary(bytes) {
+    const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    if (view.length < 2 || view.length < 2 + view[1]) return null;
+    const id = new TextDecoder().decode(view.subarray(2, 2 + view[1]));
+    return { kind: view[0], id, data: view.subarray(2 + view[1]) };
+}
 
 /** Phone-facing paths look like /c/<code>/rest?query. Never log the code. */
 const CLIENT_PATH = /^\/c\/([A-Za-z0-9_-]{16,128})(\/.*)?$/;

@@ -14,10 +14,57 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import { apnsSignerFromEnv, apnsTopic, sendWithFetch } from '../apns.mjs';
-import { VERSION, authorize, b64decode, b64encode, bearerOf, isTokenHash, parseClientPath, sanitizeCloseCode, sha256hex, turnCredentials } from '../shared.mjs';
+import {
+    BIN,
+    BODY_SLICE,
+    BODY_WINDOW,
+    PROTOCOL,
+    VERSION,
+    authorize,
+    b64decode,
+    b64encode,
+    bearerOf,
+    decodeBinary,
+    encodeBinary,
+    isTokenHash,
+    negotiateProtocol,
+    parseClientPath,
+    sanitizeCloseCode,
+    sha256hex,
+    turnCredentials,
+} from '../shared.mjs';
 
 const HEAD_TIMEOUT_MS = 120_000;
-const MAX_BODY = 24 * 1024 * 1024; // keep hreq frames well under the 32 MiB DO WebSocket message cap
+const MB = 1024 * 1024;
+const MAX_BODY = 24 * MB; // protocol 1: keep hreq frames well under the 32 MiB DO WebSocket message cap
+// Below this a body is buffered in the Worker when it may have to be offered
+// to two tunnels (see legacy tunnels); above it the Worker asks first.
+const SMALL_BODY = 1 * MB;
+
+/** A non-negative number from the environment, or the default. 0 means "no limit". */
+const limit = (value, fallback) => {
+    const n = Number(value);
+    return value !== undefined && value !== '' && Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+// Protocol 2 streams request bodies, so they are capped by MAX_BODY_MB (and
+// by your plan's request size limit: 100 MB on Free and Pro), not by DO
+// message size.
+const streamMaxBody = env => limit(env.MAX_BODY_MB, 100) * MB || Infinity;
+const stallMs = env => limit(env.STALL_TIMEOUT_S, 60) * 1000;
+const relayProtocol = env => negotiateProtocol(env.RELAY_PROTOCOL || PROTOCOL);
+const COALESCE_MS = 10;
+const TIMEOUT = Symbol('timeout');
+const sleep = ms => new Promise(resolve => setTimeout(() => resolve(TIMEOUT), ms));
+
+function concatBytes(parts, length) {
+    const out = new Uint8Array(length);
+    let at = 0;
+    for (const part of parts) {
+        out.set(part, at);
+        at += part.byteLength;
+    }
+    return out;
+}
 
 const json = (status, obj) =>
     new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json', 'access-control-allow-origin': '*' } });
@@ -36,7 +83,7 @@ export default {
         const url = new URL(request.url);
 
         if (url.pathname === '/healthz') {
-            return json(200, { ok: true, edition: 'cloudflare', version: VERSION });
+            return json(200, { ok: true, edition: 'cloudflare', version: VERSION, protocol: relayProtocol(env) });
         }
 
         if (url.pathname === '/') {
@@ -74,7 +121,17 @@ export default {
         const th = await sha256hex(parsed.code);
         const target = `https://tunnel${parsed.rest}${url.search}`;
         const legacy = legacyTunnelFor(env, th);
-        if (!legacy) return tunnelFor(env, th).fetch(clientRequest(target, request));
+        const tunnel = tunnelFor(env, th);
+        if (!legacy) return tunnel.fetch(clientRequest(target, request));
+
+        // A large or chunked body: buffering it here would undo streaming to
+        // the desktop, so ask the hinted tunnel whether the desktop is there
+        // and send the body only once.
+        const length = Number(request.headers.get('content-length'));
+        if (request.body && !(length <= SMALL_BODY)) {
+            const probe = await tunnel.fetch(new Request('https://tunnel/', { headers: { 'x-alma-tunnel-role': 'probe' } }));
+            return (probe.headers.has(OFFLINE_HEADER) ? legacy : tunnel).fetch(clientRequest(target, request));
+        }
 
         // The request may go to two tunnels, so read its body once up front
         // (the tunnel buffers it anyway). A tee'd stream does not survive the
@@ -85,7 +142,7 @@ export default {
             if (body.byteLength > MAX_BODY) return json(413, { error: 'Request body too large' });
             init = { method: request.method, headers: request.headers, body, signal: request.signal };
         }
-        const response = await tunnelFor(env, th).fetch(clientRequest(target, init));
+        const response = await tunnel.fetch(clientRequest(target, init));
         if (!response.headers.has(OFFLINE_HEADER)) return response;
         return legacy.fetch(clientRequest(target, init));
     },
@@ -190,9 +247,36 @@ export class TunnelDO extends DurableObject {
         }
     }
 
+    /** Negotiated protocol of the registered agent (1 if none). */
+    agentProto() {
+        return this.agentSocket()?.deserializeAttachment()?.proto || 1;
+    }
+
+    /** A binary frame (protocol 2 only). */
+    sendBinaryToAgent(kind, id, payload) {
+        const agent = this.agentSocket();
+        if (!agent) return false;
+        try {
+            agent.send(encodeBinary(kind, id, payload));
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /** A phone WebSocket message (string or ArrayBuffer), in the form the agent speaks. */
+    sendWsToAgent(id, message) {
+        const isBinary = typeof message !== 'string';
+        if (this.agentProto() >= 2) {
+            return this.sendBinaryToAgent(isBinary ? BIN.WBIN : BIN.WTEXT, id, isBinary ? new Uint8Array(message) : message);
+        }
+        return this.sendToAgent(isBinary ? { t: 'wmsg', id, b: b64encode(new Uint8Array(message)) } : { t: 'wmsg', id, s: message });
+    }
+
     async fetch(request) {
         const role = request.headers.get('x-alma-tunnel-role');
         if (role === 'agent') return this.acceptAgent();
+        if (role === 'probe') return this.agentSocket() ? new Response(null, { status: 204 }) : offline();
         if (role === 'client') {
             if ((request.headers.get('upgrade') || '').toLowerCase() === 'websocket') {
                 return this.acceptClientSocket(request);
@@ -231,14 +315,18 @@ export class TunnelDO extends DurableObject {
 
         const url = new URL(request.url);
         const id = this.nextId('h');
+        // Protocol 2 streams the body after `hreq`; protocol 1 sends it whole.
+        const streaming = this.agentProto() >= 2 && request.body !== null;
 
-        let body;
-        try {
-            const buf = await request.arrayBuffer();
-            if (buf.byteLength > MAX_BODY) return json(413, { error: 'Request body too large' });
-            body = buf.byteLength > 0 ? new Uint8Array(buf) : null;
-        } catch {
-            return json(400, { error: 'Failed to read request body' });
+        let body = null;
+        if (!streaming && request.body) {
+            try {
+                const buf = await request.arrayBuffer();
+                if (buf.byteLength > MAX_BODY) return json(413, { error: 'Request body too large' });
+                body = buf.byteLength > 0 ? new Uint8Array(buf) : null;
+            } catch {
+                return json(400, { error: 'Failed to read request body' });
+            }
         }
 
         const headers = {};
@@ -256,19 +344,24 @@ export class TunnelDO extends DurableObject {
             headResolve: null,
             headersSent: false,
             timer: null,
+            credit: BODY_WINDOW, // request body bytes the desktop has room for
+            wake: null, // resolves a body pump waiting for credit
         };
         this.pending.set(id, entry);
 
         const head = new Promise(resolve => {
             entry.headResolve = resolve;
+        });
+        // The desktop has the whole request: from here it must answer in time.
+        const armHeadTimer = () => {
             entry.timer = setTimeout(() => {
                 if (this.pending.get(id) === entry && !entry.headersSent) {
                     this.pending.delete(id);
                     this.sendToAgent({ t: 'hcancel', id });
-                    resolve({ status: 504, error: true, message: 'Desktop did not respond in time' });
+                    entry.headResolve({ status: 504, error: true, message: 'Desktop did not respond in time' });
                 }
             }, HEAD_TIMEOUT_MS);
-        });
+        };
 
         const self = this;
         const stream = new ReadableStream({
@@ -305,6 +398,7 @@ export class TunnelDO extends DurableObject {
                 clearTimeout(entry.timer);
                 self.sendToAgent({ t: 'hcancel', id });
                 entry.close?.();
+                entry.wake?.();
             }
         };
         // The phone hung up (needs the enable_request_signal compatibility
@@ -319,12 +413,14 @@ export class TunnelDO extends DurableObject {
             path: url.pathname + url.search,
             headers,
             b: body ? b64encode(body) : undefined,
+            ...(streaming ? { stream: true } : {}),
         });
         if (!sent) {
             this.pending.delete(id);
-            clearTimeout(entry.timer);
             return json(502, { error: 'Desktop disconnected from relay' });
         }
+        if (streaming) this.pumpBody(id, entry, request.body, armHeadTimer);
+        else armHeadTimer();
 
         const res = await head;
         if (res.error) {
@@ -348,22 +444,133 @@ export class TunnelDO extends DurableObject {
         return new Response(stream, { status: res.status, headers: resHeaders });
     }
 
+    /**
+     * Protocol 2: stream a phone's request body to the desktop, never more
+     * than BODY_WINDOW bytes ahead of its `hack`s. A desktop that reads
+     * slowly slows the phone's upload down instead of filling this DO.
+     */
+    async pumpBody(id, entry, body, armHeadTimer) {
+        const live = () => this.pending.get(id) === entry;
+        const maxBody = streamMaxBody(this.env);
+        const reader = body.getReader();
+        const giveUp = () => reader.cancel().catch(() => {});
+        const abort = (status, message) => {
+            giveUp();
+            if (!live()) return;
+            this.pending.delete(id);
+            clearTimeout(entry.timer);
+            this.sendToAgent({ t: 'hcancel', id });
+            if (!entry.headersSent) entry.headResolve?.({ status, error: true, message });
+            else entry.fail?.(message);
+        };
+        // Request bodies arrive in small reads (4 KiB in workerd), and a
+        // WebSocket message per read is slow. Coalesce reads into slices of
+        // up to BODY_SLICE; a slice is sent early when the phone pauses, so a
+        // trickling body still reaches the desktop as it comes.
+        const parts = [];
+        let pendingBytes = 0;
+        const flush = async () => {
+            if (!pendingBytes) return true;
+            while (entry.credit <= 0 && live()) {
+                if (!(await this.creditFor(entry))) {
+                    abort(504, 'Desktop stopped reading the request body');
+                    return false;
+                }
+            }
+            if (!live()) return false;
+            const slice = parts.length === 1 ? parts[0] : concatBytes(parts, pendingBytes);
+            parts.length = 0;
+            pendingBytes = 0;
+            if (!this.sendBinaryToAgent(BIN.HBODY, id, slice)) {
+                abort(502, 'Desktop disconnected from relay');
+                return false;
+            }
+            entry.credit -= slice.byteLength;
+            return true;
+        };
+        let size = 0;
+        let read = reader.read();
+        try {
+            for (;;) {
+                const next = pendingBytes ? await Promise.race([read, sleep(COALESCE_MS)]) : await read;
+                if (next === TIMEOUT) {
+                    if (!(await flush())) return giveUp();
+                    continue;
+                }
+                if (next.done) break;
+                read = reader.read();
+                if (!live()) return giveUp(); // the desktop already answered, or gave up
+                const value = next.value;
+                size += value.byteLength;
+                if (size > maxBody) return abort(413, 'Request body too large');
+                for (let offset = 0; offset < value.byteLength; ) {
+                    const take = Math.min(value.byteLength - offset, BODY_SLICE - pendingBytes);
+                    parts.push(value.subarray(offset, offset + take));
+                    pendingBytes += take;
+                    offset += take;
+                    if (pendingBytes >= BODY_SLICE && !(await flush())) return giveUp();
+                }
+            }
+            if (!(await flush())) return;
+        } catch {
+            return abort(400, 'Failed to read request body');
+        }
+        if (!live()) return;
+        this.sendToAgent({ t: 'hreqend', id });
+        if (!entry.headersSent) armHeadTimer();
+    }
+
+    /** Resolves true when the desktop acknowledges more body, false on a stall. */
+    creditFor(entry) {
+        const stall = stallMs(this.env);
+        return new Promise(resolve => {
+            const timer = stall
+                ? setTimeout(() => {
+                      entry.wake = null;
+                      resolve(false);
+                  }, stall)
+                : null;
+            entry.wake = () => {
+                clearTimeout(timer);
+                entry.wake = null;
+                resolve(true);
+            };
+        });
+    }
+
+    onBinaryFrame(message) {
+        const frame = decodeBinary(message);
+        if (!frame) return;
+        if (frame.kind === BIN.HCHUNK) {
+            this.pending.get(frame.id)?.enqueue?.(frame.data);
+            return;
+        }
+        if (frame.kind !== BIN.WBIN && frame.kind !== BIN.WTEXT) return;
+        const client = this.clientSocket(frame.id);
+        if (!client) return;
+        try {
+            client.send(frame.kind === BIN.WTEXT ? new TextDecoder().decode(frame.data) : frame.data);
+        } catch {
+            /* client gone */
+        }
+    }
+
     async webSocketMessage(ws, message) {
         const attachment = ws.deserializeAttachment() || {};
 
         if (attachment.role === 'client') {
             // Phone -> desktop traffic on a bridged socket.
-            const frame =
-                typeof message === 'string'
-                    ? { t: 'wmsg', id: attachment.id, s: message }
-                    : { t: 'wmsg', id: attachment.id, b: b64encode(new Uint8Array(message)) };
             const queue = this.preOpenQueues.get(attachment.id);
-            if (queue) queue.push(frame);
-            else this.sendToAgent(frame);
+            if (queue) queue.push(message);
+            else this.sendWsToAgent(attachment.id, message);
             return;
         }
 
         if (attachment.role !== 'agent') return;
+        if (typeof message !== 'string' && attachment.registered && attachment.proto >= 2) {
+            this.onBinaryFrame(message);
+            return;
+        }
 
         let frame;
         try {
@@ -416,8 +623,9 @@ export class TunnelDO extends DurableObject {
             // never heard of: the edge still answers its pings, so it never
             // redials, and every request times out (Node edition: Agent.destroy).
             if (replaced) this.dropTunnels('Desktop reconnected');
-            ws.serializeAttachment({ role: 'agent', registered: true, account });
-            ws.send(JSON.stringify({ t: 'registered' }));
+            const proto = negotiateProtocol(frame.proto, relayProtocol(this.env));
+            ws.serializeAttachment({ role: 'agent', registered: true, account, proto });
+            ws.send(JSON.stringify({ t: 'registered', proto }));
             if (account) console.log(`[relay] agent registered for account ${account}`);
             return;
         }
@@ -444,11 +652,20 @@ export class TunnelDO extends DurableObject {
                 entry.enqueue?.(b64decode(frame.b || ''));
                 break;
             }
+            case 'hack': {
+                const entry = this.pending.get(frame.id);
+                const n = Number(frame.n);
+                if (!entry || !(n > 0)) return;
+                entry.credit = Math.min(BODY_WINDOW, entry.credit + n);
+                if (entry.credit > 0) entry.wake?.();
+                break;
+            }
             case 'hend': {
                 const entry = this.pending.get(frame.id);
                 if (!entry) return;
                 this.pending.delete(frame.id);
                 entry.close?.();
+                entry.wake?.(); // a body still being pumped stops
                 break;
             }
             case 'herr': {
@@ -456,6 +673,7 @@ export class TunnelDO extends DurableObject {
                 if (!entry) return;
                 this.pending.delete(frame.id);
                 clearTimeout(entry.timer);
+                entry.wake?.();
                 if (!entry.headersSent) {
                     entry.headResolve?.({ status: 502, error: true, message: String(frame.message || 'Upstream error') });
                 } else {
@@ -466,7 +684,7 @@ export class TunnelDO extends DurableObject {
             case 'wopened': {
                 const queue = this.preOpenQueues.get(String(frame.id));
                 this.preOpenQueues.delete(String(frame.id));
-                for (const queued of queue || []) this.sendToAgent(queued);
+                for (const queued of queue || []) this.sendWsToAgent(String(frame.id), queued);
                 break;
             }
             case 'werr': {
@@ -530,6 +748,7 @@ export class TunnelDO extends DurableObject {
     dropTunnels(reason) {
         for (const [id, entry] of this.pending) {
             clearTimeout(entry.timer);
+            entry.wake?.();
             if (!entry.headersSent) entry.headResolve?.({ status: 502, error: true, message: 'Desktop disconnected from relay' });
             else entry.fail?.('Desktop disconnected from relay');
             this.pending.delete(id);

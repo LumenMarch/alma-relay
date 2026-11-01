@@ -24,13 +24,14 @@ desktop (agent)  ──WSS /agent?th=<tokenHash>──▶  relay  ◀── HTTP
 
 ## Agent socket
 
-JSON text frames. Bodies and binary messages are base64 (`b`); text WebSocket
-messages travel as `s`.
+JSON text frames. In protocol 1, bodies and binary messages are base64 (`b`);
+text WebSocket messages travel as `s`. Protocol 2 (below) moves payloads into
+binary frames and streams request bodies.
 
 | Direction | Frame | Meaning |
 | --- | --- | --- |
-| agent → relay | `{t:'register', tokenHash, name?, ver?, key?}` | First frame. `key` is the registration key or relay token, if the relay wants one. |
-| relay → agent | `{t:'registered'}` / `{t:'error', message}` | Then close codes: `4002` bad hash, `4003` bad key, `4401` bad relay token. |
+| agent → relay | `{t:'register', tokenHash, name?, ver?, key?, proto?}` | First frame. `key` is the registration key or relay token, if the relay wants one. `proto` is the newest protocol the desktop speaks. |
+| relay → agent | `{t:'registered', proto?}` / `{t:'error', message}` | `proto` is the protocol for this socket. Then close codes: `4002` bad hash, `4003` bad key, `4401` bad relay token. |
 | relay → agent | close `4000` | Another agent registered the same hash. Don't redial in a loop. |
 | relay → agent | `{t:'hreq', id, method, path, headers, b?}` | A phone made an HTTP request. `path` includes the query. |
 | agent → relay | `{t:'hres', id, status, headers}` | Response head. Send it promptly: the relay gives up after 120 s. |
@@ -44,15 +45,70 @@ messages travel as `s`.
 | agent → relay | `{t:'push', id, notifications:[{token, environment, collapseId?, pushType?, priority?, payload}]}` | Ask the relay to deliver APNs notifications. `pushType: 'liveactivity'` sends a Live Activity update (to `<topic>.push-type.liveactivity`); `priority: 5` sends it at low priority. |
 | relay → agent | `{t:'pushed', id, results:[{token, status, reason?}]}` / `{t:'pushed', id, unsupported:true}` | Per-token outcome, or "this relay has no APNs key". |
 
+In protocol 2 the desktop may also send `hchunk` and `wmsg` as binary frames,
+and the relay sends phone WebSocket messages that way; see below.
+
 When the agent socket closes, the relay fails in-flight requests with `502`
 and closes every bridged phone socket with `1012`, so phones redial instead of
 talking into a dead tunnel.
+
+## Protocol 2
+
+Relay ≥ 1.2.0. Negotiated per agent socket, so every pairing keeps working:
+
+| Desktop | Relay | Result |
+| --- | --- | --- |
+| offers nothing (older Alma) | any | protocol 1 |
+| offers `proto: 2` | < 1.2.0: replies `{t:'registered'}` | protocol 1 (no `proto` in the reply means 1) |
+| offers `proto: 2` | ≥ 1.2.0 | protocol 2 |
+| offers `proto: 3` | ≥ 1.2.0 | protocol 2: the relay answers with the newest it has |
+
+`RELAY_PROTOCOL=1` makes a relay answer `proto: 1` to everyone, a kill switch
+if protocol 2 misbehaves. `/healthz` reports the newest protocol the relay speaks.
+
+### Binary frames
+
+```
+[kind: u8][idLen: u8][id: idLen bytes, UTF-8][payload: rest of the frame]
+```
+
+| kind | Direction | Meaning |
+| --- | --- | --- |
+| `1` HCHUNK | agent → relay | Response body bytes for `id` (replaces `{t:'hchunk', b}`) |
+| `2` HBODY | relay → agent | Request body bytes for `id` |
+| `3` WBIN | both | Binary WebSocket message on `id` |
+| `4` WTEXT | both | Text WebSocket message on `id`, UTF-8 payload |
+
+The JSON forms stay valid in protocol 2; a relay accepts either.
+
+### Streamed request bodies
+
+A request with a body arrives as `{t:'hreq', …, stream: true}` with no `b`, as
+soon as the relay has the head. Then:
+
+| Direction | Frame | Meaning |
+| --- | --- | --- |
+| relay → agent | HBODY frames | The body, in pieces of at most 256 KiB |
+| relay → agent | `{t:'hreqend', id}` | The body is complete |
+| agent → relay | `{t:'hack', id, n}` | The desktop consumed `n` more body bytes |
+
+The relay keeps at most 4 MiB per request un-acknowledged, so a desktop that
+reads slowly slows the phone's upload down instead of filling the relay. A
+desktop that acknowledges nothing for `STALL_TIMEOUT_S` while the relay waits
+gets `hcancel` and the phone `504`. The 120 s wait for the response head starts
+at `hreqend`. The desktop may answer before the body ends (`hres`/`hend`); the
+relay then discards the rest. A body over the limit gets `413` and `hcancel`.
+
+On Cloudflare the edge takes in a whole request body before a Worker runs, so
+there the desktop sees the request only once the upload is done. Protocol 2
+still lifts the 24 MB cap, keeps bodies out of Durable Object memory, and
+paces them to the desktop.
 
 ## HTTP endpoints
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /healthz` | `{ok, edition, version}` (+ `agents` on the Node edition) |
+| `GET /healthz` | `{ok, edition, version, protocol}` (+ `agents` on the Node edition) |
 | `GET /agent` (WebSocket) | Desktop agents register here |
 | `ANY /c/<token>/…` | Tunneled HTTP / WebSocket traffic to one desktop |
 | `POST /turn` | Short-lived TURN credentials (`Authorization: Bearer <key or relay token>` when the relay is gated); `404` if TURN is not configured |
@@ -61,12 +117,13 @@ talking into a dead tunnel.
 
 | | Node | Cloudflare |
 | --- | --- | --- |
-| Request body | 128 MB (`MAX_BODY_MB`) | 24 MB (Durable Object WebSocket messages are capped at 32 MiB) |
+| Request body | 128 MB (`MAX_BODY_MB`) | protocol 1: 24 MB (Durable Object WebSocket messages are capped at 32 MiB); protocol 2: 100 MB (`MAX_BODY_MB`; also your plan's upload limit) |
 | Waiting for the response head | 120 s | 120 s |
 | Agent frame | 32 MiB | 32 MiB |
 | Phone WebSocket message | 24 MiB | 24 MiB |
 | Phone bytes held before `wopened` | 4 MiB (then close `1009`) | — |
-| Request bodies buffered at once | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
+| Request bodies buffered at once (protocol 1) | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
+| Un-acknowledged request body (protocol 2) | 4 MiB per request | 4 MiB per request |
 | Desktops | 10 000 (`MAX_AGENTS`, then close `1013`) | — |
 | Concurrent requests / sockets per desktop | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) | — |
 | Registering | within 10 s of connecting | — |
@@ -79,6 +136,9 @@ desktop sends, the relay stops reading the agent socket once that phone has
 1 MiB. A phone that drains nothing for `STALL_TIMEOUT_S` (60 s) is cut off
 (`hcancel`, or the bridged socket is terminated). The other way round, phone
 sockets are paused while the agent socket has more than 8 MiB unsent.
+
+Streamed request bodies (protocol 2) are paced per request by `hack` instead,
+on both editions.
 
 The pause covers the whole agent socket, so one stuck phone briefly holds up
 the desktop's other streams until it drains or is cut off. Desktops should

@@ -6,6 +6,8 @@
 //   node test/e2e.mjs                          # Node edition (spawns index.mjs)
 //   node test/e2e.mjs --cloudflare             # Cloudflare edition (spawns `wrangler dev --local`)
 //   node test/e2e.mjs https://relay.example.com  # smoke-test a deployed, open relay
+//   node test/e2e.mjs https://relay.example.com --protocol2 --stall-timeout=3 --max-body-mb=48
+//       # ...plus the protocol-2 suite, for a deployment with those settings
 //
 // Exit status is the number of failed checks (0 = all pass).
 
@@ -25,6 +27,14 @@ const EDITION = EXTERNAL ? 'external' : ARGS.includes('--cloudflare') ? 'cloudfl
 const SLACK = EDITION === 'node' ? 1 : 4; // timing tolerance multiplier
 const BACKEND_PORT = 23000 + Math.floor(Math.random() * 500);
 let nextRelayPort = 18800 + Math.floor(Math.random() * 500);
+
+const argValue = name => ARGS.find(a => a.startsWith(`--${name}=`))?.split('=')[1];
+// wrangler dev's local workerd drops a request whose body is left half-read
+// (a paused or abandoned upload), which deployed Workers handle. Those checks
+// run against a deployment instead: --protocol2 with the settings it has.
+const HALF_READ_OK = EDITION !== 'cloudflare';
+const skip = (name, why) => console.log(`  - ${name} (skipped: ${why})`);
+const WRANGLER_DEV = 'wrangler dev drops half-read request bodies; run --protocol2 against a deployment';
 
 let failures = 0;
 const check = (name, ok, detail = '') => {
@@ -108,6 +118,11 @@ const backend = createServer((req, res) => {
     if (req.url === '/api/big') {
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(bigPayload.length) });
         return res.end(bigPayload);
+    }
+    if (req.url === '/api/early') {
+        // Answers without reading the request body.
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        return res.end('early');
     }
     if (req.url === '/api/empty') {
         res.writeHead(204);
@@ -196,6 +211,37 @@ async function waitFor(fn, ms = 3000) {
     return false;
 }
 
+/**
+ * A phone upload whose body is produced on demand, so the test can see how
+ * much of it the relay has taken. Optionally pauses after the first chunk.
+ */
+function streamingUpload(url, total, { chunk = 256 * 1024, pauseAfterFirstMs = 0 } = {}) {
+    const block = randomBytes(chunk);
+    const hash = createHash('sha256');
+    const state = { pushed: 0, sha: null };
+    const body = new ReadableStream(
+        {
+            async pull(controller) {
+                if (state.pushed >= total) {
+                    state.sha = hash.digest('hex');
+                    return controller.close();
+                }
+                if (state.pushed === chunk && pauseAfterFirstMs) await sleep(pauseAfterFirstMs);
+                const piece = block.subarray(0, Math.min(chunk, total - state.pushed));
+                hash.update(piece);
+                state.pushed += piece.length;
+                controller.enqueue(new Uint8Array(piece));
+            },
+        },
+        { highWaterMark: 0 }
+    );
+    state.response = fetch(url, { method: 'POST', body, duplex: 'half' }).then(
+        async res => ({ status: res.status, body: await res.text() }),
+        err => ({ status: 0, body: String(err?.cause?.code || err) })
+    );
+    return state;
+}
+
 function mintToken(secret, claims) {
     const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url');
     const input = `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(claims)}`;
@@ -203,10 +249,13 @@ function mintToken(secret, claims) {
 }
 
 // ---------------------------------------------------------------------------
-// Suite 1: an open relay — the tunnel itself
+// Suite 1: an open relay — the tunnel itself, once with a protocol-1 desktop
+// (one that never mentions `proto`) and once with a protocol-2 desktop
 // ---------------------------------------------------------------------------
 console.log(`[e2e] edition: ${EDITION}`);
-{
+for (const PROTO of [1, 2]) {
+    console.log(`  — protocol ${PROTO} desktop`);
+    const offer = PROTO === 2 ? 2 : undefined;
     const relay = await startRelay();
     const CODE = newCode();
     const base = `${relay.origin}/c/${CODE}`;
@@ -215,8 +264,9 @@ console.log(`[e2e] edition: ${EDITION}`);
         const health = await (await fetch(`${relay.origin}/healthz`)).json();
         check('GET /healthz', health.ok === true, JSON.stringify(health));
 
-        const agent = await connected({ relay: relay.origin, code: CODE, wopenDelayMs: 150 });
+        const agent = await connected({ relay: relay.origin, code: CODE, wopenDelayMs: 150, proto: offer });
         check('desktop registers', true);
+        check(`…and speaks protocol ${PROTO}`, agent.proto === PROTO && (agent.registered.proto ?? 1) === PROTO, JSON.stringify(agent.registered));
 
         {
             const res = await fetch(`${base}/api/health`);
@@ -317,12 +367,21 @@ console.log(`[e2e] edition: ${EDITION}`);
             agent.send({ t: 'push', id: 'p1', notifications: [] });
             check('push → unsupported without an APNs key', await waitFor(() => agent.pushReplies[0]?.unsupported === true), JSON.stringify(agent.pushReplies));
         }
+        if (PROTO === 2) {
+            check(
+                'protocol 2: payloads travel in binary frames and bodies are streamed',
+                agent.stats.binaryIn > 0 && agent.stats.binaryOut > 0 && agent.stats.jsonData === 0 && agent.stats.streamed >= 2,
+                JSON.stringify(agent.stats)
+            );
+        } else {
+            check('protocol 1: no binary frames, no streamed bodies', agent.stats.binaryIn === 0 && agent.stats.binaryOut === 0 && agent.stats.streamed === 0, JSON.stringify(agent.stats));
+        }
         {
             // A newer desktop with the same code takes over; the old one is
             // told so and phone sockets bridged through it are dropped.
             const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
             await waitFor(() => agent.sockets.size === 1);
-            const agent2 = await connected({ relay: relay.origin, code: CODE });
+            const agent2 = await connected({ relay: relay.origin, code: CODE, proto: offer });
             const oldClosed = await waitFor(() => agent.closed);
             const phoneCode = await Promise.race([ws.closedWith, sleep(3000 * SLACK).then(() => 'open')]);
             const res = await fetch(`${base}/api/health`);
@@ -338,7 +397,7 @@ console.log(`[e2e] edition: ${EDITION}`);
             check('…and later requests get 502', after.status === 502, `status=${after.status}`);
         }
     } catch (e) {
-        check('suite: open relay', false, e.stack);
+        check(`suite: open relay (protocol ${PROTO})`, false, e.stack);
         if (relay.log) console.log(relay.log());
     } finally {
         relay.stop();
@@ -439,9 +498,23 @@ if (EDITION === 'cloudflare') {
         check('…over WebSocket too', await waitFor(() => ws.messages.includes('hello-from-desktop')));
         ws.close();
         legacy.close();
-        const moved = await connected({ relay: relay.origin, code: CODE });
+        await sleep(200);
+
+        // Protocol 2 with a hint: a large body is streamed, not buffered in
+        // the Worker, to whichever tunnel the desktop is in.
+        const legacy2 = await connected({ relay: relay.origin, code: CODE, agentQuery: '&legacy=1', proto: 2 });
+        const up = streamingUpload(`${relay.origin}/c/${CODE}/api/upload`, 8 * 1024 * 1024);
+        const r1 = await up.response;
+        check('a streamed body reaches a desktop in its un-hinted tunnel', r1.status === 200 && JSON.parse(r1.body).sha === up.sha && legacy2.stats.streamed === 1, `${r1.status} ${r1.body}`);
+        legacy2.close();
+        await sleep(200);
+
+        const moved = await connected({ relay: relay.origin, code: CODE, proto: 2 });
         const again = await fetch(`${relay.origin}/c/${CODE}/api/health`);
         check('…and in the hinted tunnel once it redials', again.status === 200, `status=${again.status}`);
+        const up2 = streamingUpload(`${relay.origin}/c/${CODE}/api/upload`, 8 * 1024 * 1024);
+        const r2 = await up2.response;
+        check('…streamed there too', r2.status === 200 && JSON.parse(r2.body).sha === up2.sha && moved.stats.streamed === 1, `${r2.status} ${r2.body}`);
         moved.close();
     } catch (e) {
         check('suite: legacy tunnels', false, e.stack);
@@ -538,6 +611,135 @@ if (EDITION === 'node') {
         if (relay.log) console.log(relay.log());
     } finally {
         relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 6: protocol 2 — streamed request bodies with flow control
+// ---------------------------------------------------------------------------
+if (!EXTERNAL || ARGS.includes('--protocol2')) {
+    // MAX_BUFFERED_MB is far below the uploads below: a relay that buffered
+    // them (protocol 1) would answer 503.
+    const STALL_S = EXTERNAL ? Number(argValue('stall-timeout')) || 0 : 2;
+    const MAX_MB = EXTERNAL ? Number(argValue('max-body-mb')) || 0 : 1; // for the 413 check
+    const relay = await startRelay({ STALL_TIMEOUT_S: String(STALL_S), MAX_BUFFERED_MB: '8' });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 2 });
+        const offered3 = await connected({ relay: relay.origin, code: newCode(), proto: 3 });
+        check('a desktop offering a newer protocol gets the newest the relay has', offered3.proto === 2 && offered3.registered.proto === 2, JSON.stringify(offered3.registered));
+        offered3.close();
+
+        {
+            const up = streamingUpload(`${base}/api/upload`, 40 * 1024 * 1024);
+            const res = await up.response;
+            const body = res.status === 200 ? JSON.parse(res.body) : {};
+            check('40 MB upload streamed intact (over the protocol-1 body limit)', res.status === 200 && body.sha === up.sha && body.n === 40 * 1024 * 1024, `${res.status} ${res.body}`);
+        }
+        // Cloudflare's edge takes in the whole request body before a Worker
+        // runs, so there the desktop can only see it once the phone is done.
+        const edition = EXTERNAL ? (await (await fetch(`${relay.origin}/healthz`)).json()).edition : null; // wrangler dev streams
+        if (edition === 'cloudflare') skip('hreq and the first body bytes reach the desktop before the upload ends', "Cloudflare's edge buffers request bodies");
+        else {
+            // The desktop sees the request while the phone is still uploading.
+            const [requests, bytes] = [agent.hreqs.length, agent.stats.bodyBytes];
+            const up = streamingUpload(`${base}/api/upload`, 4 * 1024 * 1024, { pauseAfterFirstMs: 1500 * SLACK });
+            const early = await waitFor(() => agent.hreqs.length > requests && agent.stats.bodyBytes > bytes, 1200);
+            const midway = up.pushed;
+            const res = await up.response;
+            check(
+                'hreq and the first body bytes reach the desktop before the upload ends',
+                early && midway < 4 * 1024 * 1024 && res.status === 200 && JSON.parse(res.body).sha === up.sha,
+                `early=${early} pushed=${midway} ${res.status}`
+            );
+        }
+        if (!HALF_READ_OK) {
+            skip('desktop not reading: the phone is held back, then completes', WRANGLER_DEV);
+            skip('desktop that stops reading for STALL_TIMEOUT_S → 504', WRANGLER_DEV);
+            skip('desktop answering before reading the body', WRANGLER_DEV);
+        } else {
+        {
+            // A desktop that stops reading holds the phone back...
+            agent.holdBodies = true;
+            // Bigger than the window and the socket buffers, within MAX_BODY_MB.
+            const up = streamingUpload(`${base}/api/upload`, Math.min(96, MAX_MB > 2 ? MAX_MB - 1 : 96) * 1024 * 1024);
+            await sleep(1000);
+            const pushed = up.pushed;
+            check('desktop not reading: the phone is held back (upload backpressure)', pushed < 40 * 1024 * 1024, `${(pushed / 1048576).toFixed(1)} MB pushed`);
+            // ...and gets every byte once it reads again (before the stall timeout).
+            agent.releaseBodies();
+            const res = await up.response;
+            check('…and the upload completes once it reads again', res.status === 200 && JSON.parse(res.body).sha === up.sha, `${res.status} ${res.body}`);
+        }
+        if (!STALL_S) skip('desktop that stops reading for STALL_TIMEOUT_S → 504', 'pass --stall-timeout=S for this deployment');
+        else {
+            agent.holdBodies = true;
+            const up = streamingUpload(`${base}/api/upload`, 32 * 1024 * 1024);
+            const res = await Promise.race([up.response, sleep((STALL_S * 1000 + 6000) * SLACK).then(() => ({ status: 'hung' }))]);
+            check('desktop that stops reading for STALL_TIMEOUT_S → 504', res.status === 504, `${res.status} ${res.body || ''}`);
+            agent.holdBodies = false;
+            agent.held = [];
+        }
+        {
+            const up = streamingUpload(`${base}/api/early`, 32 * 1024 * 1024);
+            const res = await Promise.race([up.response, sleep(8000 * SLACK).then(() => ({ status: 'hung' }))]);
+            check('desktop answering before reading the body', res.status === 200 && res.body === 'early', `${res.status} ${res.body || ''}`);
+            const after = await fetch(`${base}/api/health`);
+            check('…leaves the tunnel working', after.status === 200, `status=${after.status}`);
+        }
+        }
+        agent.close();
+    } catch (e) {
+        check('suite: protocol 2', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+
+    // Limits still apply to streamed bodies, and RELAY_PROTOCOL=1 makes a
+    // relay act like one that predates protocol 2.
+    const small = !HALF_READ_OK || !MAX_MB ? null : await startRelay({ MAX_BODY_MB: String(MAX_MB) });
+    if (!small) skip('streamed body over MAX_BODY_MB → 413', HALF_READ_OK ? 'pass --max-body-mb=N for this deployment' : WRANGLER_DEV);
+    else try {
+        const CODE2 = newCode();
+        const agent = await connected({ relay: small.origin, code: CODE2, proto: 2 });
+        const up = streamingUpload(`${small.origin}/c/${CODE2}/api/upload`, (MAX_MB + 2) * 1024 * 1024);
+        const res = await up.response;
+        check('streamed body over MAX_BODY_MB → 413', res.status === 413, `${res.status} ${res.body}`);
+        const after = await fetch(`${small.origin}/c/${CODE2}/api/health`);
+        check('…and the tunnel still works', after.status === 200, `status=${after.status}`);
+        agent.close();
+    } catch (e) {
+        check('suite: protocol 2 limits', false, e.stack);
+        if (small.log) console.log(small.log());
+    } finally {
+        small.stop();
+    }
+
+    const v1 = EXTERNAL ? null : await startRelay({ RELAY_PROTOCOL: '1' });
+    if (v1) try {
+        const CODE3 = newCode();
+        const agent = await connected({ relay: v1.origin, code: CODE3, proto: 2 });
+        check('RELAY_PROTOCOL=1: a protocol-2 desktop falls back to 1', agent.proto === 1, JSON.stringify(agent.registered));
+        const up = randomBytes(2 * 1024 * 1024);
+        const body = await (await fetch(`${v1.origin}/c/${CODE3}/api/upload`, { method: 'POST', body: up })).json();
+        const ws = await openPhoneSocket(`${v1.origin.replace(/^http/, 'ws')}/c/${CODE3}/ws/echo`);
+        ws.send(Buffer.from([9, 8, 7]));
+        ws.send('text');
+        const echoed = await waitFor(() => ws.messages.length >= 2);
+        ws.close();
+        check(
+            '…and still tunnels uploads and WebSockets, all as JSON',
+            body.sha === sha(up) && echoed && Buffer.isBuffer(ws.messages[0]) && ws.messages[1] === 'text' && agent.stats.binaryIn === 0 && agent.stats.binaryOut === 0,
+            JSON.stringify(agent.stats)
+        );
+        agent.close();
+    } catch (e) {
+        check('suite: RELAY_PROTOCOL=1', false, e.stack);
+        if (v1.log) console.log(v1.log());
+    } finally {
+        v1.stop();
     }
 }
 
