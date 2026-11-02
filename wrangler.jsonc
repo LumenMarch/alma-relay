@@ -17,6 +17,7 @@
         //   RELAY_REGISTRATION_KEY  shared key desktops must present
         //   RELAY_TOKEN_SECRET      HS256 secret for per-user relay tokens
         //   APNS_KEY / APNS_KEY_ID / APNS_TEAM_ID   phone notifications
+        //   FCM_SERVICE_ACCOUNT     Firebase service-account JSON (Android notifications)
         //   TURN_SECRET             coturn static-auth-secret
         //
         // "LOCATION_HINT": "apac",

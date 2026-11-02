@@ -14,6 +14,7 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import { apnsSignerFromEnv, apnsTopic, sendWithFetch } from '../apns.mjs';
+import { fcmSenderFromEnv, deliverPush } from '../fcm.mjs';
 import {
     BIN,
     BODY_SLICE,
@@ -191,6 +192,21 @@ export class TunnelDO extends DurableObject {
         // APNS_KEY secret — the agent is then told `unsupported` and the
         // desktop stops trying. The provider token is cached on the instance.
         this.apns = undefined;
+        // FCM sender (see ../../fcm.mjs) from the FCM_SERVICE_ACCOUNT secret;
+        // null without one. Android notifications then come back FcmUnsupported.
+        this.fcm = undefined;
+    }
+
+    fcmSender() {
+        if (this.fcm === undefined) {
+            try {
+                this.fcm = fcmSenderFromEnv(this.env);
+            } catch (err) {
+                console.error('[relay] FCM service account misconfigured:', err instanceof Error ? err.message : err);
+                this.fcm = null;
+            }
+        }
+        return this.fcm;
     }
 
     apnsSigner() {
@@ -210,11 +226,15 @@ export class TunnelDO extends DurableObject {
     async handlePush(frame) {
         const id = String(frame.id || '');
         const signer = this.apnsSigner();
-        if (!signer) {
+        const fcm = this.fcmSender();
+        if (!signer && !fcm) {
             this.sendToAgent({ t: 'pushed', id, unsupported: true });
             return;
         }
-        const results = await sendWithFetch(signer, apnsTopic(this.env), frame.notifications);
+        const results = await deliverPush(frame.notifications, {
+            sendApns: signer ? list => sendWithFetch(signer, apnsTopic(this.env), list) : null,
+            fcm,
+        });
         const failed = results.filter(r => r.status !== 200).length;
         if (failed)
             console.warn(

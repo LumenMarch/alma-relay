@@ -23,6 +23,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import { apnsSignerFromEnv, apnsTopic, apnsHost, apnsRequestHeaders, clampBatch, validateNotification, resultFromResponse } from './apns.mjs';
+import { fcmSenderFromEnv, deliverPush } from './fcm.mjs';
 import {
     BIN,
     BODY_SLICE,
@@ -87,6 +88,18 @@ try {
     console.error('[relay] APNs key misconfigured:', err instanceof Error ? err.message : err);
 }
 const APNS_TOPIC = apnsTopic(apnsEnv);
+
+// FCM (optional, Android phones): the Firebase service-account JSON, inline
+// or from a file. Read once at startup and never logged.
+let fcmSender = null;
+try {
+    fcmSender = fcmSenderFromEnv({
+        ...env,
+        FCM_SERVICE_ACCOUNT: env.FCM_SERVICE_ACCOUNT || (env.FCM_SERVICE_ACCOUNT_FILE ? readFileSync(env.FCM_SERVICE_ACCOUNT_FILE, 'utf8') : ''),
+    });
+} catch (err) {
+    console.error('[relay] FCM service account misconfigured:', err instanceof Error ? err.message : err);
+}
 
 /** One notification over a fresh HTTP/2 session (Node's fetch is HTTP/1.1 only). */
 function apnsPostHttp2(host, path, headers, body) {
@@ -681,11 +694,11 @@ function handleAgent(ws) {
         switch (frame.t) {
             case 'push': {
                 const id = String(frame.id || '');
-                if (!apnsSigner) {
+                if (!apnsSigner && !fcmSender) {
                     agent.send({ t: 'pushed', id, unsupported: true });
                     return;
                 }
-                sendPushBatch(frame.notifications).then(results => {
+                deliverPush(frame.notifications, { sendApns: apnsSigner ? sendPushBatch : null, fcm: fcmSender }).then(results => {
                     const failed = results.filter(r => r.status !== 200);
                     if (failed.length)
                         console.warn(
@@ -903,7 +916,7 @@ const pinger = setInterval(() => {
 
 server.listen(PORT, HOST, () => {
     const gate = env.RELAY_TOKEN_SECRET ? 'signed relay tokens' : env.RELAY_REGISTRATION_KEY ? 'registration key' : 'open';
-    const extras = [apnsSigner && 'APNs', env.TURN_URLS && env.TURN_SECRET && 'TURN'].filter(Boolean);
+    const extras = [apnsSigner && 'APNs', fcmSender && 'FCM', env.TURN_URLS && env.TURN_SECRET && 'TURN'].filter(Boolean);
     console.log(`[relay] Alma relay ${VERSION} listening on ${HOST}:${PORT} (access: ${gate}${extras.length ? `; ${extras.join(', ')}` : ''})`);
 });
 

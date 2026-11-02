@@ -94,6 +94,7 @@ npx github:yetone/alma-relay
 | `LOCATION_HINT` | 仅 Cloudflare：指定隧道所在区域，例如 `apac`、`enam`、`weur`。默认会建在离桌面端近的地方；桌面端通过代理、离手机很远时，可以用它把隧道放到手机附近。改了之后，每台桌面端下次重连时会换到新区域的隧道；还没重连的，手机也照样找得到。 |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | 为手机实时查看桌面浏览器（WebRTC）签发 TURN 凭据。 |
 | `APNS_KEY_FILE` 或 `APNS_KEY`，以及 `APNS_KEY_ID`、`APNS_TEAM_ID`、`APNS_TOPIC` | 手机通知（见下文）。 |
+| `FCM_SERVICE_ACCOUNT_FILE` 或 `FCM_SERVICE_ACCOUNT` | 通过 Firebase 给 Android 手机发通知（见下文）。 |
 
 ### 谁能使用你的中继
 
@@ -124,7 +125,18 @@ APNS_KEY_FILE=/path/AuthKey_XXXX.p8 APNS_KEY_ID=XXXX APNS_TEAM_ID=YYYY APNS_TOPI
 # Cloudflare：wrangler secret put APNS_KEY < AuthKey_XXXX.p8（以及 APNS_KEY_ID、APNS_TEAM_ID）
 ```
 
-没有配置密钥时，中继会回复 `unsupported`，桌面端之后就不会再请求推送。
+Android 手机走 Firebase Cloud Messaging。把 Firebase 项目的服务账号密钥交给中继
+（Firebase 控制台 → 项目设置 → 服务账号 → 生成新的私钥）：
+
+```bash
+FCM_SERVICE_ACCOUNT_FILE=/path/service-account.json
+# Cloudflare：wrangler secret put FCM_SERVICE_ACCOUNT < service-account.json
+```
+
+和 APNs 一样，Firebase 只会把推送送到这个密钥所属项目的 App。只配了其中一种密钥时，
+另一种手机会收到 `ApnsUnsupported` / `FcmUnsupported`。
+
+两种密钥都没有配置时，中继会回复 `unsupported`，桌面端之后就不会再请求推送。
 
 ### 实时浏览器画面用的 TURN
 

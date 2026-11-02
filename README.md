@@ -130,6 +130,7 @@ settings) on Cloudflare. All of them are optional.
 | `LOCATION_HINT` | Cloudflare only: where tunnels live, for example `apac`, `enam` or `weur`. By default a tunnel is created near the desktop. Set this when the desktop sits behind a proxy far away from the phone. Changing it moves each desktop to a new tunnel the next time it redials; phones find desktops that haven't yet. |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | Serve TURN credentials for the phone's live view of the desktop browser (WebRTC). |
 | `APNS_KEY_FILE` or `APNS_KEY`, plus `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` | Phone notifications (see below). |
+| `FCM_SERVICE_ACCOUNT_FILE` or `FCM_SERVICE_ACCOUNT` | Android phone notifications through Firebase (see below). |
 
 ### Who can use your relay
 
@@ -163,7 +164,20 @@ APNS_KEY_FILE=/path/AuthKey_XXXX.p8 APNS_KEY_ID=XXXX APNS_TEAM_ID=YYYY APNS_TOPI
 # Cloudflare: wrangler secret put APNS_KEY < AuthKey_XXXX.p8  (and APNS_KEY_ID, APNS_TEAM_ID)
 ```
 
-Without a key, the relay reports `unsupported` and the desktop stops asking.
+Android phones are notified through Firebase Cloud Messaging instead. Give the
+relay the Firebase project's service-account key (Firebase console → Project
+settings → Service accounts → Generate new private key):
+
+```bash
+FCM_SERVICE_ACCOUNT_FILE=/path/service-account.json
+# Cloudflare: wrangler secret put FCM_SERVICE_ACCOUNT < service-account.json
+```
+
+Like APNs, Firebase only delivers to the app of the project that key belongs
+to. A relay with only one of the two keys answers the other kind of phone as
+`ApnsUnsupported` / `FcmUnsupported`.
+
+Without either key, the relay reports `unsupported` and the desktop stops asking.
 
 ### TURN for the live browser view
 

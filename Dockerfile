@@ -3,7 +3,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
-COPY index.mjs shared.mjs apns.mjs ./
+COPY index.mjs shared.mjs apns.mjs fcm.mjs ./
 COPY scripts/mint-token.mjs ./scripts/
 USER node
 ENV PORT=8787
