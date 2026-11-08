@@ -44,6 +44,7 @@ const env = process.env;
 const PORT = Number(env.PORT || 8787);
 const HOST = env.HOST || '0.0.0.0';
 const MB = 1024 * 1024;
+const mb = bytes => `${(bytes / MB).toFixed(1)} MB`;
 /** A non-negative number from the environment, or the default. 0 means "no limit". */
 const limit = (value, fallback) => {
     const n = Number(value);
@@ -69,9 +70,15 @@ const CLIENT_MAX_MESSAGE = 24 * MB; // base64 makes it at most 32 MiB in a wmsg 
 const OPEN_QUEUE_MAX = 4 * MB; // phone bytes held while the desktop opens its side
 // Flow control: above HIGH_WATER buffered bytes the sender is paused until
 // the buffer drains below LOW_WATER.
-const HIGH_WATER = 8 * MB;
-const LOW_WATER = 1 * MB;
+const HIGH_WATER = (limit(env.FLOW_HIGH_WATER_MB, 8) || 8) * MB;
+const LOW_WATER = Math.min((limit(env.FLOW_LOW_WATER_MB, 1) || 1) * MB, HIGH_WATER / 2);
 const FLOW_TICK_MS = 25;
+// While the agent socket is paused the relay can't read the desktop's pings,
+// so it sends unsolicited pongs (RFC 6455 §5.5.3) on this interval: a desktop
+// that is being pushed back on must not take the relay for gone and redial.
+const PAUSED_PONG_MS = 5_000;
+// A pause this long is logged (with its cause and, at the end, its length).
+const PAUSE_LOG_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // APNs (optional). With no key the relay answers `unsupported` and the
@@ -186,7 +193,23 @@ class Agent {
         /** phone WebSockets and uploads paused until the agent socket drains */
         this.waiting = new Set();
         this.paused = false;
+        /** when this pause began, the last unsolicited pong, the sink that caused it, and whether it was logged */
+        this.pause = null;
         this.flowTimer = null;
+    }
+
+    /** A short, non-secret tag for logs. */
+    get tag() {
+        return this.tokenHash.slice(0, 8);
+    }
+
+    /** Keep the desktop's heartbeat satisfied while its socket isn't read. */
+    keepAlive(now) {
+        if (now - this.pause.ponged < PAUSED_PONG_MS || this.ws.readyState !== WebSocket.OPEN) return;
+        this.pause.ponged = now;
+        try {
+            this.ws.pong();
+        } catch {}
     }
 
     send(frame) {
@@ -222,6 +245,8 @@ class Agent {
         if (!this.paused) {
             this.paused = true;
             this.ws.pause();
+            this.pause = { since: Date.now(), ponged: 0, key, bytes: level(), logged: false };
+            this.keepAlive(this.pause.since);
         }
         this.startFlow();
     }
@@ -248,6 +273,7 @@ class Agent {
                 sink.last = level;
                 sink.since = now;
             } else if (STALL_MS && now - sink.since > STALL_MS) {
+                console.log(`[relay] agent ${this.tag}: ${key} drained nothing for ${STALL_MS / 1000}s with ${mb(level)} queued; cut off`);
                 this.sinks.delete(key);
                 try {
                     sink.kill();
@@ -257,7 +283,15 @@ class Agent {
         if (this.paused && !this.sinks.size) {
             this.paused = false;
             this.isAlive = true; // pongs were not read while paused
+            if (this.pause.logged) console.log(`[relay] agent ${this.tag}: reading again after ${((now - this.pause.since) / 1000).toFixed(1)}s`);
+            this.pause = null;
             if (this.ws.readyState === WebSocket.OPEN) this.ws.resume();
+        } else if (this.paused) {
+            this.keepAlive(now);
+            if (!this.pause.logged && now - this.pause.since >= PAUSE_LOG_MS) {
+                this.pause.logged = true;
+                console.log(`[relay] agent ${this.tag}: not reading it, ${this.pause.key} has ${mb(this.pause.bytes)} queued for the phone (over ${mb(HIGH_WATER)})`);
+            }
         }
         if (this.waiting.size && (this.ws.bufferedAmount < LOW_WATER || this.ws.readyState !== WebSocket.OPEN)) {
             for (const source of this.waiting) source.resume();

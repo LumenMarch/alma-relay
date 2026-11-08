@@ -615,6 +615,43 @@ if (EDITION === 'node') {
 }
 
 // ---------------------------------------------------------------------------
+// Suite 5b (Node edition): a desktop held back by a slow phone is not dropped
+// ---------------------------------------------------------------------------
+if (EDITION === 'node') {
+    // A phone that reads nothing for 7 s pauses the agent socket. The relay
+    // can't read the desktop's pings meanwhile, so it must keep the desktop's
+    // heartbeat fed (unsolicited pongs) — otherwise the desktop redials, its
+    // herdr viewers resync, the phone backs up again: a loop.
+    const relay = await startRelay({ STALL_TIMEOUT_S: '20', FLOW_HIGH_WATER_MB: '4' });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE });
+        let pongs = 0;
+        agent.ws.on('pong', () => pongs++);
+        const stuck = await new Promise((resolve, reject) =>
+            httpGet(`${base}/api/firehose?mb=256`, { agent: false }, res => (res.pause(), resolve(res))).on('error', reject)
+        );
+        await sleep(7000);
+        check('paused agent socket: the desktop still gets pongs', pongs >= 2, `pongs=${pongs}`);
+        check('paused agent socket: the desktop is not dropped', agent.ws.readyState === WebSocket.OPEN && !agent.closed, `state=${agent.ws.readyState}`);
+        check('a long pause is logged with its cause', /not reading it, h:\S+ has [\d.]+ MB queued/.test(relay.log()), relay.log());
+        let received = 0;
+        const ended = new Promise(r => stuck.on('end', () => r('end')).on('close', () => r('close')));
+        stuck.on('data', c => (received += c.length));
+        stuck.resume();
+        check('the phone then gets the whole body', (await ended) === 'end' && received === 256 * 1024 * 1024, `received=${received}`);
+        check('the end of the pause is logged', /reading again after [\d.]+s/.test(relay.log()), relay.log());
+        agent.close();
+    } catch (e) {
+        check('suite: paused keepalive', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Suite 6: protocol 2 — streamed request bodies with flow control
 // ---------------------------------------------------------------------------
 if (!EXTERNAL || ARGS.includes('--protocol2')) {

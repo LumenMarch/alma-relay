@@ -132,8 +132,11 @@ paces them to the desktop.
 
 The relay never buffers a whole stream. When a phone reads slower than the
 desktop sends, the relay stops reading the agent socket once that phone has
-8 MiB queued, which pushes back on the desktop over TCP; it resumes below
-1 MiB. A phone that drains nothing for `STALL_TIMEOUT_S` (60 s) is cut off
+8 MiB queued (`FLOW_HIGH_WATER_MB`), which pushes back on the desktop over
+TCP; it resumes below 1 MiB (`FLOW_LOW_WATER_MB`). While it isn't reading, the
+relay can't see the desktop's pings, so it sends the desktop an unsolicited
+pong every 5 s: a desktop must count any pong (or any frame) as the relay being
+alive, not only the answer to its own ping. A pause over 2 s is logged. A phone that drains nothing for `STALL_TIMEOUT_S` (60 s) is cut off
 (`hcancel`, or the bridged socket is terminated). The other way round, phone
 sockets are paused while the agent socket has more than 8 MiB unsent.
 
