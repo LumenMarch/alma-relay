@@ -89,9 +89,10 @@ npx github:yetone/alma-relay
 | `MAX_AGENTS` | Node 版：同时在线的桌面端上限（默认 10000）。 |
 | `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Node 版：每台桌面端的并发 HTTP 请求 / WebSocket 上限（默认各 256）。 |
 | `MAX_CONNECTIONS` | Node 版：进程的 TCP 连接上限（默认不限）。 |
-| `FLOW_HIGH_WATER_MB` / `FLOW_LOW_WATER_MB` | 某个手机端积压到这么多 MB 时暂停读取对应桌面端，降到低水位以下再恢复。默认 8 / 1。见[流控](docs/PROTOCOL.md#flow-control-node-edition)。 |
+| `FLOW_STREAM_WINDOW_KB` | 协议 3 的桌面端：每条流最多领先 relay 多少 KB（默认 1024）。这样慢的手机只会拖住自己那条流。见[协议 3](docs/PROTOCOL.md#protocol-3)。 |
+| `FLOW_HIGH_WATER_MB` / `FLOW_LOW_WATER_MB` | Node 版：某个手机端积压到这么多 MB 时暂停读取对应桌面端，降到低水位以下再恢复。默认 8 / 1。对协议 3 的桌面端只是兜底。见[流控](docs/PROTOCOL.md#flow-control-node-edition)。 |
 | `STALL_TIMEOUT_S` | 手机端这么多秒读不走任何数据就断开（Node 版）；协议 2 的桌面端这么多秒不接收上传数据也会被断开（两个版本都有）。默认 60。见[流控](docs/PROTOCOL.md#flow-control-node-edition)。 |
-| `RELAY_PROTOCOL` | 设为 `1` 就不再向桌面端提供[协议 2](docs/PROTOCOL.md#protocol-2)（流式上传、二进制帧）。默认 `2`。 |
+| `RELAY_PROTOCOL` | 向桌面端提供的最高协议版本（默认 `3`）。设为 `2` 关闭[按流流控](docs/PROTOCOL.md#protocol-3)；设为 `1` 连[协议 2](docs/PROTOCOL.md#protocol-2)（流式上传、二进制帧）也关掉。 |
 | `LOCATION_HINT` | 仅 Cloudflare：指定隧道所在区域，例如 `apac`、`enam`、`weur`。默认会建在离桌面端近的地方；桌面端通过代理、离手机很远时，可以用它把隧道放到手机附近。改了之后，每台桌面端下次重连时会换到新区域的隧道；还没重连的，手机也照样找得到。 |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | 为手机实时查看桌面浏览器（WebRTC）签发 TURN 凭据。 |
 | `APNS_KEY_FILE` 或 `APNS_KEY`，以及 `APNS_KEY_ID`、`APNS_TEAM_ID`、`APNS_TOPIC` | 手机通知（见下文）。 |

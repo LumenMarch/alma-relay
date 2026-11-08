@@ -125,9 +125,10 @@ settings) on Cloudflare. All of them are optional.
 | `MAX_AGENTS` | Node: most desktops at once (`10000`). |
 | `MAX_REQUESTS_PER_AGENT` / `MAX_SOCKETS_PER_AGENT` | Node: concurrent HTTP requests / WebSockets per desktop (`256` each). |
 | `MAX_CONNECTIONS` | Node: TCP connection cap for the process (unset: no cap). |
-| `FLOW_HIGH_WATER_MB` / `FLOW_LOW_WATER_MB` | Stop reading a desktop once one of its phones has this much queued, and read again below the low mark (`8` / `1`). See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |
+| `FLOW_STREAM_WINDOW_KB` | Protocol-3 desktops: how many KB of one stream a desktop may send ahead of the relay (`1024`). A slow phone then holds back only its own stream. See [protocol 3](docs/PROTOCOL.md#protocol-3). |
+| `FLOW_HIGH_WATER_MB` / `FLOW_LOW_WATER_MB` | Node: stop reading a desktop once one of its phones has this much queued, and read again below the low mark (`8` / `1`). A safety net for protocol-3 desktops. See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |
 | `STALL_TIMEOUT_S` | Cut off a phone that reads nothing for this many seconds (Node), or a protocol-2 desktop that takes in none of an upload (both editions) (`60`). See [flow control](docs/PROTOCOL.md#flow-control-node-edition). |
-| `RELAY_PROTOCOL` | Set to `1` to stop offering [protocol 2](docs/PROTOCOL.md#protocol-2) (streamed uploads, binary frames) to desktops. Default `2`. |
+| `RELAY_PROTOCOL` | Newest protocol offered to desktops (`3`). `2` turns off [per-stream flow control](docs/PROTOCOL.md#protocol-3); `1` also turns off [protocol 2](docs/PROTOCOL.md#protocol-2) (streamed uploads, binary frames). |
 | `LOCATION_HINT` | Cloudflare only: where tunnels live, for example `apac`, `enam` or `weur`. By default a tunnel is created near the desktop. Set this when the desktop sits behind a proxy far away from the phone. Changing it moves each desktop to a new tunnel the next time it redials; phones find desktops that haven't yet. |
 | `TURN_URLS` / `TURN_SECRET` / `TURN_TTL` | Serve TURN credentials for the phone's live view of the desktop browser (WebRTC). |
 | `APNS_KEY_FILE` or `APNS_KEY`, plus `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` | Phone notifications (see below). |

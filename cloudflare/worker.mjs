@@ -17,6 +17,7 @@ import { apnsSignerFromEnv, apnsTopic, sendWithFetch } from '../apns.mjs';
 import { fcmSenderFromEnv, deliverPush } from '../fcm.mjs';
 import {
     BIN,
+    AckBatcher,
     BODY_SLICE,
     BODY_WINDOW,
     PROTOCOL,
@@ -32,6 +33,7 @@ import {
     parseClientPath,
     sanitizeCloseCode,
     sha256hex,
+    streamWindow,
     turnCredentials,
 } from '../shared.mjs';
 
@@ -188,6 +190,8 @@ export class TunnelDO extends DurableObject {
         this.pending = new Map(); // id -> {enqueue, close, fail, headResolve, timer, headersSent}
         this.preOpenQueues = new Map(); // client ws id -> frames queued until agent sends wopened
         this.counter = 0;
+        // Protocol 3: response body / WebSocket bytes acknowledged per stream.
+        this.acks = new AckBatcher((id, n) => this.sendToAgent({ t: 'ack', id, n }));
         // APNs signer (see ../../apns.mjs); null when the deployment has no
         // APNS_KEY secret — the agent is then told `unsupported` and the
         // desktop stops trying. The provider token is cached on the instance.
@@ -366,6 +370,8 @@ export class TunnelDO extends DurableObject {
             timer: null,
             credit: BODY_WINDOW, // request body bytes the desktop has room for
             wake: null, // resolves a body pump waiting for credit
+            enqueued: 0, // response body bytes handed to the stream
+            acked: 0, // ...and acknowledged to the desktop (protocol 3)
         };
         this.pending.set(id, entry);
 
@@ -384,34 +390,51 @@ export class TunnelDO extends DurableObject {
         };
 
         const self = this;
-        const stream = new ReadableStream({
-            start(controller) {
-                entry.enqueue = chunk => {
-                    try {
-                        controller.enqueue(chunk);
-                    } catch {
-                        /* client gone */
+        // Protocol 3: bytes the phone's response has taken out of this queue
+        // are acknowledged, so the desktop keeps at most its window queued
+        // here for a phone that reads slowly — and only on this stream.
+        const QUEUE_MARK = 256 * 1024;
+        const acks = this.agentProto() >= 3;
+        const stream = new ReadableStream(
+            {
+                start(controller) {
+                    entry.enqueue = chunk => {
+                        try {
+                            controller.enqueue(chunk);
+                            entry.enqueued += chunk.byteLength;
+                        } catch {
+                            /* client gone */
+                        }
+                    };
+                    entry.close = () => {
+                        try {
+                            controller.close();
+                        } catch {
+                            /* already closed */
+                        }
+                    };
+                    entry.fail = message => {
+                        try {
+                            controller.error(new Error(message));
+                        } catch {
+                            /* already closed */
+                        }
+                    };
+                },
+                pull(controller) {
+                    if (!acks) return;
+                    const delivered = entry.enqueued - Math.max(0, QUEUE_MARK - (controller.desiredSize ?? QUEUE_MARK));
+                    if (delivered > entry.acked && self.pending.get(id) === entry) {
+                        self.acks.add(id, delivered - entry.acked);
+                        entry.acked = delivered;
                     }
-                };
-                entry.close = () => {
-                    try {
-                        controller.close();
-                    } catch {
-                        /* already closed */
-                    }
-                };
-                entry.fail = message => {
-                    try {
-                        controller.error(new Error(message));
-                    } catch {
-                        /* already closed */
-                    }
-                };
+                },
+                cancel() {
+                    cancelRequest();
+                },
             },
-            cancel() {
-                cancelRequest();
-            },
-        });
+            { highWaterMark: QUEUE_MARK, size: chunk => chunk.byteLength }
+        );
         const cancelRequest = () => {
             if (self.pending.get(id) === entry) {
                 self.pending.delete(id);
@@ -570,6 +593,8 @@ export class TunnelDO extends DurableObject {
         if (!client) return;
         try {
             client.send(frame.kind === BIN.WTEXT ? new TextDecoder().decode(frame.data) : frame.data);
+            // A Workers WebSocket reports no backpressure: what it took is delivered.
+            if (this.agentProto() >= 3) this.acks.add(frame.id, frame.data.byteLength);
         } catch {
             /* client gone */
         }
@@ -645,7 +670,7 @@ export class TunnelDO extends DurableObject {
             if (replaced) this.dropTunnels('Desktop reconnected');
             const proto = negotiateProtocol(frame.proto, relayProtocol(this.env));
             ws.serializeAttachment({ role: 'agent', registered: true, account, proto });
-            ws.send(JSON.stringify({ t: 'registered', proto }));
+            ws.send(JSON.stringify({ t: 'registered', proto, ...(proto >= 3 ? { window: streamWindow(this.env.FLOW_STREAM_WINDOW_KB) } : {}) }));
             if (account) console.log(`[relay] agent registered for account ${account}`);
             return;
         }

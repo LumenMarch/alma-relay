@@ -19,7 +19,12 @@ export class FakeAgent {
         this.opts = opts;
         this.proto = 1; // negotiated
         this.registered = null; // the relay's `registered` frame
-        this.stats = { binaryIn: 0, binaryOut: 0, jsonData: 0, streamed: 0, bodyBytes: 0 };
+        this.stats = { binaryIn: 0, binaryOut: 0, jsonData: 0, streamed: 0, bodyBytes: 0, acks: 0, windowWaits: 0 };
+        // Protocol 3: per-stream bytes sent and not yet acknowledged, and the
+        // stream waiting for acks to resume.
+        this.window = Infinity;
+        this.unacked = new Map();
+        this.waiting = new Map();
         this.hreqs = []; // {id, stream, at}
         // While true, request body bytes are neither written nor acknowledged.
         this.holdBodies = false;
@@ -56,7 +61,8 @@ export class FakeAgent {
                 const frame = JSON.parse(data.toString());
                 if (frame.t === 'registered') {
                     this.registered = frame;
-                    this.proto = this.opts.proto >= 2 && frame.proto >= 2 ? 2 : 1;
+                    this.proto = this.opts.proto >= 2 && frame.proto >= 2 ? Math.min(this.opts.proto, frame.proto) : 1;
+                    if (this.proto >= 3) this.window = frame.window;
                     return settle(resolve);
                 }
                 if (frame.t === 'error') {
@@ -95,6 +101,34 @@ export class FakeAgent {
         if (this.proto >= 2) return this.sendBinary(isBinary ? BIN.WBIN : BIN.WTEXT, id, data);
         this.stats.jsonData++;
         this.send(isBinary ? { t: 'wmsg', id, b: Buffer.from(data).toString('base64') } : { t: 'wmsg', id, s: data.toString() });
+    }
+
+    /** Protocol 3: count `n` bytes sent on stream `id`; pause it with `hold()` once its window is full. */
+    spent(id, n, hold, release) {
+        if (this.proto < 3) return;
+        const unacked = (this.unacked.get(id) || 0) + n;
+        this.unacked.set(id, unacked);
+        if (unacked >= this.window && !this.waiting.has(id)) {
+            this.stats.windowWaits++;
+            hold();
+            this.waiting.set(id, release);
+        }
+    }
+
+    acked(id, n) {
+        this.stats.acks++;
+        const unacked = Math.max(0, (this.unacked.get(id) || 0) - n);
+        this.unacked.set(id, unacked);
+        const release = this.waiting.get(id);
+        if (release && unacked < this.window) {
+            this.waiting.delete(id);
+            release();
+        }
+    }
+
+    forget(id) {
+        this.unacked.delete(id);
+        this.waiting.delete(id);
     }
 
     onBinary(data) {
@@ -142,21 +176,27 @@ export class FakeAgent {
                     },
                     res => {
                         this.send({ t: 'hres', id: frame.id, status: res.statusCode, headers: res.headers });
+                        // Reading stops while anything holds it: the stream's window or the relay socket.
+                        const holds = new Set();
+                        const hold = why => (holds.add(why), res.pause());
+                        const release = why => holds.delete(why) && !holds.size && res.resume();
                         res.on('data', chunk => {
                             this.sendBody(frame.id, chunk);
+                            this.spent(frame.id, chunk.length, () => hold('window'), () => release('window'));
                             // Like Alma's desktop, wait for the relay socket to drain.
-                            if (this.ws.bufferedAmount > 1024 * 1024) {
-                                res.pause();
+                            if (this.ws.bufferedAmount > 1024 * 1024 && !holds.has('socket')) {
+                                hold('socket');
                                 const timer = setInterval(() => {
                                     if (this.ws.bufferedAmount < 256 * 1024 || this.ws.readyState !== WebSocket.OPEN) {
                                         clearInterval(timer);
-                                        res.resume();
+                                        release('socket');
                                     }
                                 }, 10);
                             }
                         });
                         res.on('end', () => {
                             this.http.delete(frame.id);
+                            this.forget(frame.id);
                             this.send({ t: 'hend', id: frame.id });
                         });
                     }
@@ -177,7 +217,11 @@ export class FakeAgent {
                 if (req) this.whenReleased(() => req.end());
                 break;
             }
+            case 'ack':
+                this.acked(frame.id, Number(frame.n));
+                break;
             case 'hcancel':
+                this.forget(frame.id);
                 this.http.get(frame.id)?.destroy();
                 this.http.delete(frame.id);
                 break;
@@ -185,8 +229,12 @@ export class FakeAgent {
                 const ws = new WebSocket(`ws://127.0.0.1:${backendPort}${frame.path}`);
                 this.sockets.set(frame.id, ws);
                 ws.on('open', () => setTimeout(() => this.send({ t: 'wopened', id: frame.id }), this.opts.wopenDelayMs || 0));
-                ws.on('message', (data, isBinary) => this.sendWs(frame.id, data, isBinary));
+                ws.on('message', (data, isBinary) => {
+                    this.sendWs(frame.id, data, isBinary);
+                    this.spent(frame.id, data.length, () => ws.pause(), () => ws.resume());
+                });
                 ws.on('close', (code, reason) => {
+                    this.forget(frame.id);
                     if (this.sockets.delete(frame.id)) this.send({ t: 'wclose', id: frame.id, code, reason: reason.toString() });
                 });
                 ws.on('error', err => {

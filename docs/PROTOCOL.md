@@ -31,7 +31,7 @@ binary frames and streams request bodies.
 | Direction | Frame | Meaning |
 | --- | --- | --- |
 | agent → relay | `{t:'register', tokenHash, name?, ver?, key?, proto?}` | First frame. `key` is the registration key or relay token, if the relay wants one. `proto` is the newest protocol the desktop speaks. |
-| relay → agent | `{t:'registered', proto?}` / `{t:'error', message}` | `proto` is the protocol for this socket. Then close codes: `4002` bad hash, `4003` bad key, `4401` bad relay token. |
+| relay → agent | `{t:'registered', proto?, window?}` / `{t:'error', message}` | `proto` is the protocol for this socket; `window` comes with protocol 3. Then close codes: `4002` bad hash, `4003` bad key, `4401` bad relay token. |
 | relay → agent | close `4000` | Another agent registered the same hash. Don't redial in a loop. |
 | relay → agent | `{t:'hreq', id, method, path, headers, b?}` | A phone made an HTTP request. `path` includes the query. |
 | agent → relay | `{t:'hres', id, status, headers}` | Response head. Send it promptly: the relay gives up after 120 s. |
@@ -61,10 +61,11 @@ Relay ≥ 1.2.0. Negotiated per agent socket, so every pairing keeps working:
 | offers nothing (older Alma) | any | protocol 1 |
 | offers `proto: 2` | < 1.2.0: replies `{t:'registered'}` | protocol 1 (no `proto` in the reply means 1) |
 | offers `proto: 2` | ≥ 1.2.0 | protocol 2 |
-| offers `proto: 3` | ≥ 1.2.0 | protocol 2: the relay answers with the newest it has |
+| offers `proto: 3` | 1.2.x / 1.3.x | protocol 2: the relay answers with the newest it has |
+| offers `proto: 3` | ≥ 1.4.0 | protocol 3 (below) |
 
 `RELAY_PROTOCOL=1` makes a relay answer `proto: 1` to everyone, a kill switch
-if protocol 2 misbehaves. `/healthz` reports the newest protocol the relay speaks.
+if protocol 2 misbehaves; `RELAY_PROTOCOL=2` does the same for protocol 3. `/healthz` reports the newest protocol the relay speaks.
 
 ### Binary frames
 
@@ -104,6 +105,34 @@ there the desktop sees the request only once the upload is done. Protocol 2
 still lifts the 24 MB cap, keeps bodies out of Durable Object memory, and
 paces them to the desktop.
 
+## Protocol 3
+
+Relay ≥ 1.4.0. Everything in protocol 2, plus per-stream credit for what the
+desktop sends: response bodies (`HCHUNK`) and WebSocket messages (`WBIN`,
+`WTEXT`).
+
+| Direction | Frame | Meaning |
+| --- | --- | --- |
+| relay → agent | `{t:'registered', proto: 3, window}` | `window`: bytes of one stream the desktop may have un-acknowledged (default 1 MiB, `FLOW_STREAM_WINDOW_KB`, at least 64 KiB) |
+| relay → agent | `{t:'ack', id, n}` | `n` more payload bytes of stream `id` are on their way to the phone |
+
+The desktop counts the payload bytes it sends on each stream (the bytes after
+the binary frame header; for a JSON `wmsg`, the decoded bytes) and sends more on
+a stream only while fewer than `window` of them are un-acknowledged. A message
+never has to be split: one may always go out while the count is under the
+window, even if it then goes over. A stream's count is forgotten when it ends.
+
+The Node edition acknowledges bytes once they are written to the phone's
+socket. The Cloudflare edition acknowledges response bytes once the phone's
+response has taken them from the Durable Object, and WebSocket messages as soon
+as they are sent (Workers report no WebSocket backpressure). Acks are batched:
+at once from 64 KiB, otherwise within a few milliseconds.
+
+So a phone that stops reading holds back only its own stream. Before protocol
+3 the Node edition had to stop reading the whole agent socket for it (below),
+stalling every other phone and tunnel on that desktop; and the Cloudflare
+edition had to hold whatever the desktop sent in Durable Object memory.
+
 ## HTTP endpoints
 
 | Endpoint | Purpose |
@@ -124,6 +153,7 @@ paces them to the desktop.
 | Phone bytes held before `wopened` | 4 MiB (then close `1009`) | — |
 | Request bodies buffered at once (protocol 1) | 512 MB (`MAX_BUFFERED_MB`, then `503`) | per Durable Object |
 | Un-acknowledged request body (protocol 2) | 4 MiB per request | 4 MiB per request |
+| Un-acknowledged response / WebSocket bytes (protocol 3) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) | 1 MiB per stream (`FLOW_STREAM_WINDOW_KB`) |
 | Desktops | 10 000 (`MAX_AGENTS`, then close `1013`) | — |
 | Concurrent requests / sockets per desktop | 256 / 256 (`MAX_REQUESTS_PER_AGENT`, `MAX_SOCKETS_PER_AGENT`, then `503`) | — |
 | Registering | within 10 s of connecting | — |
@@ -139,6 +169,11 @@ pong every 5 s: a desktop must count any pong (or any frame) as the relay being
 alive, not only the answer to its own ping. A pause over 2 s is logged. A phone that drains nothing for `STALL_TIMEOUT_S` (60 s) is cut off
 (`hcancel`, or the bridged socket is terminated). The other way round, phone
 sockets are paused while the agent socket has more than 8 MiB unsent.
+
+With a protocol-3 desktop this pause is only a safety net: the desktop stops
+at its window on the slow phone's stream, so no phone gets near 8 MiB queued,
+and a phone that writes out none of its stream for `STALL_TIMEOUT_S` is cut
+off the same way.
 
 Streamed request bodies (protocol 2) are paced per request by `hack` instead,
 on both editions.

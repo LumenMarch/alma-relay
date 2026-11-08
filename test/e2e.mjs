@@ -8,11 +8,14 @@
 //   node test/e2e.mjs https://relay.example.com  # smoke-test a deployed, open relay
 //   node test/e2e.mjs https://relay.example.com --protocol2 --stall-timeout=3 --max-body-mb=48
 //       # ...plus the protocol-2 suite, for a deployment with those settings
+//   node test/e2e.mjs https://relay.example.com --protocol3
+//       # ...plus the protocol-3 suite (a slow phone holds back only its stream)
 //
 // Exit status is the number of failed checks (0 = all pass).
 
 import { spawn } from 'node:child_process';
 import { createServer, get as httpGet } from 'node:http';
+import { get as httpsGet } from 'node:https';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -41,6 +44,8 @@ const check = (name, ok, detail = '') => {
     console.log(`${ok ? '  ✓' : '  ✗'} ${name}${ok || !detail ? '' : ` — ${detail}`}`);
     if (!ok) failures++;
 };
+const MB_ = 1024 * 1024;
+const STUCK_MB = 64;
 const newCode = () => randomBytes(32).toString('base64url');
 const sha = b => createHash('sha256').update(b).digest('hex');
 
@@ -253,9 +258,9 @@ function mintToken(secret, claims) {
 // (one that never mentions `proto`) and once with a protocol-2 desktop
 // ---------------------------------------------------------------------------
 console.log(`[e2e] edition: ${EDITION}`);
-for (const PROTO of [1, 2]) {
+for (const PROTO of [1, 2, 3]) {
     console.log(`  — protocol ${PROTO} desktop`);
-    const offer = PROTO === 2 ? 2 : undefined;
+    const offer = PROTO >= 2 ? PROTO : undefined;
     const relay = await startRelay();
     const CODE = newCode();
     const base = `${relay.origin}/c/${CODE}`;
@@ -367,9 +372,12 @@ for (const PROTO of [1, 2]) {
             agent.send({ t: 'push', id: 'p1', notifications: [] });
             check('push → unsupported without an APNs key', await waitFor(() => agent.pushReplies[0]?.unsupported === true), JSON.stringify(agent.pushReplies));
         }
-        if (PROTO === 2) {
+        if (PROTO === 3) {
+            check('protocol 3: the relay advertises a window and acknowledges what it delivers', agent.registered.window >= 64 * 1024 && agent.stats.acks > 0, JSON.stringify({ ...agent.registered, ...agent.stats }));
+        }
+        if (PROTO >= 2) {
             check(
-                'protocol 2: payloads travel in binary frames and bodies are streamed',
+                `protocol ${PROTO}: payloads travel in binary frames and bodies are streamed`,
                 agent.stats.binaryIn > 0 && agent.stats.binaryOut > 0 && agent.stats.jsonData === 0 && agent.stats.streamed >= 2,
                 JSON.stringify(agent.stats)
             );
@@ -664,8 +672,8 @@ if (!EXTERNAL || ARGS.includes('--protocol2')) {
     const base = `${relay.origin}/c/${CODE}`;
     try {
         const agent = await connected({ relay: relay.origin, code: CODE, proto: 2 });
-        const offered3 = await connected({ relay: relay.origin, code: newCode(), proto: 3 });
-        check('a desktop offering a newer protocol gets the newest the relay has', offered3.proto === 2 && offered3.registered.proto === 2, JSON.stringify(offered3.registered));
+        const offered3 = await connected({ relay: relay.origin, code: newCode(), proto: 99 });
+        check('a desktop offering a newer protocol gets the newest the relay has', offered3.proto === 3 && offered3.registered.proto === 3, JSON.stringify(offered3.registered));
         offered3.close();
 
         {
@@ -777,6 +785,78 @@ if (!EXTERNAL || ARGS.includes('--protocol2')) {
         if (v1.log) console.log(v1.log());
     } finally {
         v1.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Suite 7: protocol 3 — a slow phone holds back only its own stream
+// ---------------------------------------------------------------------------
+if (!EXTERNAL || ARGS.includes('--protocol3')) {
+    const relay = await startRelay({ STALL_TIMEOUT_S: '6' });
+    const CODE = newCode();
+    const base = `${relay.origin}/c/${CODE}`;
+    const wsBase = base.replace(/^http/, 'ws');
+    try {
+        const agent = await connected({ relay: relay.origin, code: CODE, proto: 3 });
+        check('protocol 3 negotiated, with a 1 MiB window', agent.proto === 3 && agent.registered.window === 1024 * 1024, JSON.stringify(agent.registered));
+
+        // One phone stops reading a 64 MB download...
+        const stuck = await new Promise((resolve, reject) =>
+            (base.startsWith('https:') ? httpsGet : httpGet)(`${base}/api/firehose?mb=${STUCK_MB}`, { agent: false }, res => (res.pause(), resolve(res))).on('error', reject)
+        );
+        // The desktop stops once the phone's buffers (and, deployed, the
+        // edge's) and one window are full: written bytes stop growing.
+        let before = -Infinity;
+        for (let i = 0; i < 20 && firehose.written - before > MB_; i++) {
+            before = firehose.written;
+            await sleep(1000);
+        }
+        check(
+            'the desktop is held back on that stream',
+            firehose.written - before <= MB_ && agent.waiting.size === 1 && (EDITION !== 'node' || firehose.written < 16 * MB_),
+            `${(firehose.written / MB_).toFixed(1)} MB written, waiting=${agent.waiting.size}`
+        );
+        // ...while everyone else on the same desktop carries on.
+        {
+            const t0 = Date.now();
+            const buf = Buffer.from(await (await fetch(`${base}/api/big`)).arrayBuffer());
+            check('another phone downloads 5 MB meanwhile', buf.length === bigPayload.length && sha(buf) === sha(bigPayload), `len=${buf.length} in ${Date.now() - t0}ms`);
+        }
+        {
+            // 5 MB echoed back in 128 KB messages: more than a window, both ways.
+            const ws = await openPhoneSocket(`${wsBase}/ws/echo`);
+            ws.send('hi'); // the relay holds at most 4 MB until the desktop has opened its side
+            await waitFor(() => ws.messages.length === 1);
+            const block = randomBytes(128 * 1024);
+            for (let i = 0; i < 40; i++) ws.send(block);
+            const ok = await waitFor(() => ws.messages.length >= 41, 10000);
+            check('…and a WebSocket echoes 5 MB through its own window', ok && ws.messages.slice(1).every(m => Buffer.isBuffer(m) && m.equals(block)), `got ${ws.messages.length - 1}/40`);
+            ws.close();
+        }
+        if (EDITION === 'node') check('the agent socket was never paused', !/not reading it/.test(relay.log()), relay.log());
+
+        // The slow phone reads again and gets every byte.
+        let received = 0;
+        const ended = new Promise(r => stuck.on('end', () => r('end')).on('close', () => r('close')));
+        stuck.on('data', c => (received += c.length));
+        stuck.resume();
+        check('the slow phone then gets the whole body', (await ended) === 'end' && received === STUCK_MB * 1024 * 1024, `received=${received}`);
+
+        if (EDITION === 'node') {
+            // A phone that never reads again is cut off after STALL_TIMEOUT_S.
+            const dead = await new Promise((resolve, reject) =>
+                (base.startsWith('https:') ? httpsGet : httpGet)(`${base}/api/firehose?mb=${STUCK_MB}`, { agent: false }, res => (res.pause(), resolve(res))).on('error', reject)
+            );
+            check('a stream that writes nothing is cut off and the desktop told', await waitFor(() => firehose.closed, 12000), `closed=${firehose.closed}`);
+            check('…and the cut is logged', /h:\S+ wrote nothing for 6s/.test(relay.log()), relay.log());
+            dead.destroy();
+        }
+        agent.close();
+    } catch (e) {
+        check('suite: protocol 3', false, e.stack);
+        if (relay.log) console.log(relay.log());
+    } finally {
+        relay.stop();
     }
 }
 

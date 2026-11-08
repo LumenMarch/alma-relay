@@ -2,7 +2,7 @@
 // Everything here uses WebCrypto + standard globals, so it runs unchanged in
 // Node >= 20 and inside a Worker.
 
-export const VERSION = '1.3.1';
+export const VERSION = '1.4.0';
 
 // ---------------------------------------------------------------------------
 // Agent protocol versions (docs/PROTOCOL.md).
@@ -10,12 +10,17 @@ export const VERSION = '1.3.1';
 //   1  JSON text frames only; request bodies arrive whole, base64, in `hreq`.
 //   2  Payload bytes travel in binary frames, and request bodies are streamed
 //      to the desktop with a per-request credit window.
+//   3  Per-stream downstream credit: the relay acknowledges (`ack`) the
+//      response body / WebSocket bytes of each stream once they are on their
+//      way to the phone, and the desktop keeps at most `window` bytes of a
+//      stream unacknowledged. One slow phone then holds back only its own
+//      stream, never the agent socket that every other stream shares.
 //
 // The desktop offers `proto` in `register`; the relay answers the version it
 // will speak in `registered`. Either side that never mentions it speaks 1, so
 // old desktops on new relays and new desktops on old relays keep working.
 // ---------------------------------------------------------------------------
-export const PROTOCOL = 2;
+export const PROTOCOL = 3;
 
 /** Negotiated version: the lower of what the desktop offers and the relay allows. */
 export function negotiateProtocol(offered, relayMax = PROTOCOL) {
@@ -36,6 +41,57 @@ export const BIN = Object.freeze({
 export const BODY_WINDOW = 4 * 1024 * 1024;
 /** Largest request body slice the relay puts in one frame. */
 export const BODY_SLICE = 256 * 1024;
+
+/** Protocol 3: bytes of one stream the desktop may send ahead of the relay's `ack`s. */
+export const STREAM_WINDOW = 1024 * 1024;
+/** Smallest window a relay may advertise. */
+export const MIN_STREAM_WINDOW = 64 * 1024;
+const ACK_EAGER = 64 * 1024; // acknowledged at once from this many bytes
+const ACK_DELAY_MS = 5; // smaller amounts are batched for this long
+
+/** The window a relay advertises: `kb` from its configuration, or the default. */
+export function streamWindow(kb) {
+    const n = Math.floor(Number(kb) * 1024);
+    return Number.isFinite(n) && n > 0 ? Math.max(MIN_STREAM_WINDOW, n) : STREAM_WINDOW;
+}
+
+/**
+ * Protocol 3 acknowledgements, coalesced per stream: `send(id, n)` goes out
+ * once a stream has ACK_EAGER bytes owed, or ACK_DELAY_MS after the first.
+ */
+export class AckBatcher {
+    constructor(send) {
+        this.send = send;
+        this.owed = new Map();
+        this.timer = null;
+    }
+
+    add(id, n) {
+        if (!(n > 0)) return;
+        const total = (this.owed.get(id) || 0) + n;
+        if (total >= ACK_EAGER) {
+            this.owed.delete(id);
+            this.send(id, total);
+            return;
+        }
+        this.owed.set(id, total);
+        this.timer ??= setTimeout(() => this.flush(), ACK_DELAY_MS);
+    }
+
+    flush() {
+        clearTimeout(this.timer);
+        this.timer = null;
+        const owed = [...this.owed];
+        this.owed.clear();
+        for (const [id, n] of owed) this.send(id, n);
+    }
+
+    clear() {
+        clearTimeout(this.timer);
+        this.timer = null;
+        this.owed.clear();
+    }
+}
 
 const textEncoder = new TextEncoder();
 
